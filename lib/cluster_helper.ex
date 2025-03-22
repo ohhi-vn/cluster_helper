@@ -46,4 +46,8 @@ defmodule ClusterHelper do
   def add_roles(roles) do
     NodeConfig.add_roles(roles)
   end
+
+  def get_my_roles do
+    NodeConfig.get_my_roles()
+  end
 end

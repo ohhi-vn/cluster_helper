@@ -23,7 +23,7 @@ Add rols to config for node
 config :cluster_helper,
   # all roles of current node. Can add role in runtime.
   roles: [:data, :web],
-  # for scope of :syn lib. default sope is ClusterHelper
+  # for scope of :syn lib. default scope is ClusterHelper
   scope: :my_cluster 
 ```
 
@@ -45,3 +45,34 @@ ClusterHelper.get_roles(:node1)
 
 ## Test local cluster without integrated with other app
 
+Start 2 nodes
+
+Start node1:
+
+```bash
+iex --name node1@127.0.0.1 --cookie need_to_change_this -S mix
+```
+
+```bash
+iex --name node2@127.0.0.1 --cookie need_to_change_this -S mix
+```
+
+Join & Verify all nodes by run cmd in node2 shell:
+
+```Elixir
+Node.connect(:"node1@127.0.0.1")
+
+Node.list()
+```
+
+In each iex shell add rule by cmd:
+
+```Elixir
+ClusterHelper.add_roles([:role1, :role2])
+```
+
+Verify data synced by cmd:
+
+```Elixir
+ClusterHelper.get_nodes(:role1)
+```

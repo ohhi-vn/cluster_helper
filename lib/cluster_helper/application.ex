@@ -8,8 +8,7 @@ defmodule ClusterHelper.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: ClusterHelper.Worker.start_link(arg)
-      # {ClusterHelper.Worker, arg}
+      ClusterHelper.NodeConfig,
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

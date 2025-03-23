@@ -1,7 +1,7 @@
 # ClusterHelper
 
 This lib is built on top of :syn library, help to manage dynamic Elixir cluster on environment like Kubernetes.
-Each node has roles like :data, :web, :cache other not join can easy get nodes follow a role in cluster.
+Each node has roles like :data, :web, :cache other nodes join to cluster can easy get nodes follow a role in cluster.
 Can use scope for seperating to sub cluster (current version doesn't support overlapped sub cluster).
 
 ## Installation
@@ -15,6 +15,17 @@ def deps do
     {:cluster_helper, "~0.0.3"}
   ]
 end
+```
+
+Add `:cluster_helper` to `extra_application` in mix.exs for ClusterHelper can start with your app.
+
+```Elixir
+  def application do
+    [
+      mod: {MyApp.Application, []},
+      extra_applications: [:cluster_helper]
+    ]
+  end
 ```
 
 ## Usage

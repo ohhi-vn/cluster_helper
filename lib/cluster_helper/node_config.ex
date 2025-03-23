@@ -10,7 +10,7 @@ defmodule ClusterHelper.NodeConfig do
   alias :ets, as: Ets
   alias :syn, as: Syn
 
-  @interval 5_000
+  @interval 7_000
 
   require Logger
 
@@ -19,10 +19,10 @@ defmodule ClusterHelper.NodeConfig do
   end
 
   def add_role(role) do
-    GenServer.cast(__MODULE__, {:add_role, role})
+    GenServer.cast(__MODULE__, {:add_roles, [role]})
   end
 
-  def add_roles(roles) do
+  def add_roles(roles) when is_list(roles) do
     GenServer.cast(__MODULE__, {:add_roles, roles})
   end
 
@@ -53,6 +53,14 @@ defmodule ClusterHelper.NodeConfig do
     end)
   end
 
+  def remove_role(role) do
+    GenServer.cast(__MODULE__, {:remove_roles, [role]})
+  end
+
+  def remove_roles(roles) when is_list(roles) do
+    GenServer.cast(__MODULE__, {:remove_roles, roles})
+  end
+
   ## Callbacks ##
 
   @impl true
@@ -68,18 +76,17 @@ defmodule ClusterHelper.NodeConfig do
 
     roles = Application.get_env(:cluster_helper, :roles, [])
 
-
     if !is_list(roles) do
-      Logger.error "Invalid config format (roles is a list). Please check your config file."
+      Logger.error "Invalid config format (roles is a list). Please check your config file. Roles: #{inspect roles}"
     else
       Logger.debug("ClusterHelper, NodeConfig, node's roles: #{inspect(roles)}")
 
-      do_add_roles(roles)
+      do_add_my_roles(roles)
     end
 
-    Syn.join(get_syn_scope(), :all_nodes, self(), Node.self())
-
     pull_roles()
+
+    Syn.join(get_syn_scope(), :all_nodes, self(), Node.self())
 
     Syn.publish(get_syn_scope(), :all_nodes, {:new_node, Node.self(), self()})
 
@@ -90,21 +97,28 @@ defmodule ClusterHelper.NodeConfig do
   end
 
   @impl true
-  def handle_cast({:add_role, role}, state) do
-    Logger.debug("ClusterHelper, NodeConfig, add role: #{inspect(role)}, for #{inspect(Node.self())}")
+  def handle_cast({:add_roles, roles}, state)  do
+    Logger.debug("ClusterHelper, NodeConfig, add roles: #{inspect(roles)}, for current node #{inspect(Node.self())}")
+    do_add_my_roles(roles)
 
-    do_add_role(role)
+    Logger.debug("ClusterHelper, NodeConfig, publish new roles: #{inspect(roles)}")
+    Syn.publish(get_syn_scope(), :all_nodes, {:new_roles, roles, Node.self()})
 
-    state = Enum.uniq([role | state])
+    state = Enum.uniq(state ++ roles)
 
     {:noreply, state}
   end
 
-  def handle_cast({:add_roles, roles}, state) do
-    Logger.debug("ClusterHelper, NodeConfig, add roles: #{inspect(roles)}, for #{inspect(Node.self())}")
-    do_add_roles(roles)
+  def handle_cast({:remove_roles, roles}, state) do
+    node = Node.self()
+    Logger.debug("ClusterHelper, NodeConfig, remove roles: #{inspect(roles)}, for current node #{inspect(node)}")
+    Enum.each(roles, fn role ->
+      remove_role(node, role)
+    end)
 
-    state = Enum.uniq(state ++ roles)
+    Syn.publish(get_syn_scope(), :all_nodes, {:remove_roles, roles, node})
+
+    state = state -- roles
 
     {:noreply, state}
   end
@@ -115,10 +129,29 @@ defmodule ClusterHelper.NodeConfig do
   end
 
   @impl true
-
   def handle_info(:pull_roles, state) do
     pull_roles()
     Process.send_after(self(), :pull_roles, @interval)
+    {:noreply, state}
+  end
+
+  def handle_info({:new_roles, roles, node}, state) do
+    if node != Node.self() do
+      Logger.debug("ClusterHelper, NodeConfig, new roles #{inspect(roles)} from #{inspect(node)}")
+      do_add_roles(node, roles)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:remove_roles, roles, node}, state) do
+    if node != Node.self() do
+      Logger.debug("ClusterHelper, NodeConfig, remove roles from #{inspect(node)}")
+      Enum.each(roles, fn role ->
+        remove_role(node, role)
+      end)
+    end
+
     {:noreply, state}
   end
 
@@ -139,24 +172,30 @@ defmodule ClusterHelper.NodeConfig do
 
   ## Private functions ##
 
-  defp do_add_role(role) do
-    Syn.join(get_syn_scope(), role, self(), Node.self())
-    Ets.insert(@ets_table, {{:role, role}, Node.self()})
-    Ets.insert(@ets_table, {{:node, Node.self()}, role})
+  defp do_add_role(node, role) do
+    Ets.insert(@ets_table, {{:role, role}, node})
+    Ets.insert(@ets_table, {{:node, node}, role})
   end
 
-  defp do_add_role(node, roles) do
+  defp do_add_my_role(role) do
+    node = Node.self()
+    Syn.join(get_syn_scope(), role, self(), node)
+    do_add_role(node, role)
+  end
+
+  defp do_add_roles(node, roles) do
+    Logger.debug("ClusterHelper, NodeConfig, add roles: #{inspect(roles)}, for node #{inspect(node)}")
+
     Enum.each(roles, fn role ->
-      Logger.debug("ClusterHelper, NodeConfig, add role: #{inspect(role)}, for #{inspect(node)}")
-      Ets.insert(@ets_table, {{:role, role}, node})
-      Ets.insert(@ets_table, {{:node, node}, role})
+      do_add_role(node, role)
     end)
   end
 
-  defp do_add_roles(roles) do
+  defp do_add_my_roles(roles) do
+    Logger.debug("ClusterHelper, NodeConfig, add roles: #{inspect(roles)}, for current node #{inspect(Node.self())}")
+
     Enum.each(roles, fn role ->
-      Logger.debug("ClusterHelper, NodeConfig, add role: #{inspect(role)}, for #{inspect(Node.self())}")
-      do_add_role(role)
+      do_add_my_role(role)
     end)
   end
 
@@ -169,7 +208,7 @@ defmodule ClusterHelper.NodeConfig do
         # Remove all old roles of node
         remove_node(node)
         # Add all roles of node
-        do_add_role(node, roles)
+        do_add_roles(node, roles)
       end
     end)
 
@@ -184,6 +223,11 @@ defmodule ClusterHelper.NodeConfig do
   defp remove_node(node) do
     Ets.delete(@ets_table, {:node, node})
     Ets.match_delete(@ets_table, {{:role, :_}, node})
+  end
+
+  defp remove_role(node, role) do
+    Ets.match_delete(@ets_table, {{:role, role}, node})
+    Ets.match_delete(@ets_table, {{:node, node}, role})
   end
 
   defp get_syn_scope do

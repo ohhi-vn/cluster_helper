@@ -80,3 +80,7 @@ Verify data synced by cmd:
 ```Elixir
 ClusterHelper.get_nodes(:role1)
 ```
+
+## Example
+
+You can get a full example using with EasyRpc lib on [Github](https://github.com/ohhi-vn/lib_examples/tree/main/cluster_helper)

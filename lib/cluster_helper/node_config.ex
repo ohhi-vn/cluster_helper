@@ -215,8 +215,10 @@ defmodule ClusterHelper.NodeConfig do
     live_nodes = Enum.map(nodes, fn {_, node} -> node end)
     removed_nodes = get_all_nodes() -- live_nodes
     Enum.each(removed_nodes, fn node ->
-      Logger.debug("ClusterHelper, NodeConfig, remove roles of #{inspect(node)}")
-      remove_node(node)
+      if node != Node.self() do
+        Logger.debug("ClusterHelper, NodeConfig, remove roles of #{inspect(node)}")
+        remove_node(node)
+      end
     end)
   end
 

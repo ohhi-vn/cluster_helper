@@ -35,5 +35,16 @@ defmodule ClusterHelperTest do
     assert ClusterHelper.get_nodes(:web) == []
   end
 
+  @tag timeout: 12_000
+  test "don't remove role of current node" do
+    ClusterHelper.add_role(:web)
+
+    Process.sleep( 10_000 ) # need large time for pull in NodeConfig
+
+    assert ClusterHelper.get_my_roles() == [:web]
+    assert ClusterHelper.get_roles(Node.self()) == [:web]
+    assert ClusterHelper.get_nodes(:web) == [Node.self()]
+  end
+
   # TO-DO: Add remove role test
 end

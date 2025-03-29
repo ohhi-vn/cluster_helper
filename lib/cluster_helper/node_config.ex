@@ -159,12 +159,44 @@ defmodule ClusterHelper.NodeConfig do
     {:noreply, state}
   end
 
-  def handle_info({:new_node, node, pid}, state) do
+  def handle_info({:new_node, node, _pid}, state) do
     if node != Node.self() do
-      Logger.debug("ClusterHelper, NodeConfig, pull roles from #{inspect(pid)} on #{inspect(node)}")
-      roles = GenServer.call(pid, :get_my_roles)
-      do_add_role(node, roles)
+      parent = self()
+
+      # run separated process to a void deadlock.
+      spawn(fn ->
+        Logger.debug("ClusterHelper, NodeConfig, pull new roles from #{inspect(node)}")
+
+        roles =
+          try do
+            timeout = Application.get_env(:cluster_helper, :pull_timeout, @default_timeout)
+            :erpc.call(node, ClusterHelper, :get_my_roles, [], timeout)
+          rescue
+            error ->
+              Logger.debug("ClusterHelper, NodeConfig, pull new roles from #{inspect(node)} failed, error: #{inspect(error)}")
+              []
+          end
+
+        send(parent, {:pull_new_node, node, roles})
+      end)
     end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:pull_update_node, node, roles}, state) do
+    # Remove all old roles of node
+    remove_node(node)
+    # Add all roles of node
+    do_add_roles(node, roles)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:pull_new_node, node, roles}, state) do
+    # Add all roles of node
+    do_add_roles(node, roles)
+
     {:noreply, state}
   end
 
@@ -206,31 +238,33 @@ defmodule ClusterHelper.NodeConfig do
   defp pull_roles do
     nodes = Syn.members(get_syn_scope(), :all_nodes)
 
-    Enum.each(nodes, fn {_pid, node} ->
-      if node != Node.self() do
-        Logger.debug("ClusterHelper, NodeConfig, pull roles from #{inspect(node)}")
+    parent = self()
 
-        roles =
-          try do
-            timeout = Application.get_env(:cluster_helper, :pull_timeout, @default_timeout)
-            :erpc.call(node, ClusterHelper, :get_my_roles, [], timeout)
-          rescue
-            error ->
-              Logger.debug("ClusterHelper, NodeConfig, pull roles from #{inspect(node)} failed, error: #{inspect(error)}")
-              []
-          end
+    # run separated process to a void deadlock.
+    spawn(fn ->
+      Enum.each(nodes, fn {_pid, node} ->
+        if node != parent do
+          Logger.debug("ClusterHelper, NodeConfig, pull roles from #{inspect(node)}")
 
-        # Remove all old roles of node
-        remove_node(node)
-        # Add all roles of node
-        do_add_roles(node, roles)
-      end
+          roles =
+            try do
+              timeout = Application.get_env(:cluster_helper, :pull_timeout, @default_timeout)
+              :erpc.call(node, ClusterHelper, :get_my_roles, [], timeout)
+            rescue
+              error ->
+                Logger.debug("ClusterHelper, NodeConfig, pull roles from #{inspect(node)} failed, error: #{inspect(error)}")
+                []
+            end
+
+          send(parent, {:pull_update_node, node, roles})
+        end
+      end)
     end)
 
     live_nodes = Enum.map(nodes, fn {_, node} -> node end)
     removed_nodes = get_all_nodes() -- live_nodes
     Enum.each(removed_nodes, fn node ->
-      if node != Node.self() do
+      if node != parent do
         Logger.debug("ClusterHelper, NodeConfig, remove roles of #{inspect(node)}")
         remove_node(node)
       end

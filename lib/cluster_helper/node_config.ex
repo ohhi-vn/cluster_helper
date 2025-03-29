@@ -10,7 +10,8 @@ defmodule ClusterHelper.NodeConfig do
   alias :ets, as: Ets
   alias :syn, as: Syn
 
-  @interval 7_000
+  @default_interval 7_000
+  @default_timeout 5_000
 
   require Logger
 
@@ -75,6 +76,7 @@ defmodule ClusterHelper.NodeConfig do
     Syn.add_node_to_scopes([get_syn_scope()])
 
     roles = Application.get_env(:cluster_helper, :roles, [])
+    interval = Application.get_env(:cluster_helper, :pull_interval, @default_interval)
 
     if !is_list(roles) do
       Logger.error "Invalid config format (roles is a list). Please check your config file. Roles: #{inspect roles}"
@@ -91,7 +93,7 @@ defmodule ClusterHelper.NodeConfig do
     Syn.publish(get_syn_scope(), :all_nodes, {:new_node, Node.self(), self()})
 
     # TO-DO: Improve this, currently, this way limited by cannot detected new node join in cluster.
-    Process.send_after(self(), :pull_roles, @interval)
+    Process.send_after(self(), :pull_roles, interval)
 
     {:noreply, roles}
   end
@@ -131,7 +133,9 @@ defmodule ClusterHelper.NodeConfig do
   @impl true
   def handle_info(:pull_roles, state) do
     pull_roles()
-    Process.send_after(self(), :pull_roles, @interval)
+    interval = Application.get_env(:cluster_helper, :pull_interval, @default_interval)
+
+    Process.send_after(self(), :pull_roles, interval)
     {:noreply, state}
   end
 
@@ -201,10 +205,21 @@ defmodule ClusterHelper.NodeConfig do
 
   defp pull_roles do
     nodes = Syn.members(get_syn_scope(), :all_nodes)
-    Enum.each(nodes, fn {pid, node} ->
+
+    Enum.each(nodes, fn {_pid, node} ->
       if node != Node.self() do
-        Logger.debug("ClusterHelper, NodeConfig, pull roles from #{inspect(pid)} on #{inspect(node)}")
-        roles = GenServer.call(pid, :get_my_roles)
+        Logger.debug("ClusterHelper, NodeConfig, pull roles from #{inspect(node)}")
+
+        roles =
+          try do
+            timeout = Application.get_env(:cluster_helper, :pull_timeout, @default_timeout)
+            :erpc.call(node, ClusterHelper, :get_my_roles, [], timeout)
+          rescue
+            error ->
+              Logger.debug("ClusterHelper, NodeConfig, pull roles from #{inspect(node)} failed, error: #{inspect(error)}")
+              []
+          end
+
         # Remove all old roles of node
         remove_node(node)
         # Add all roles of node

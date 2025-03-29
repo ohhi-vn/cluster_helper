@@ -36,11 +36,19 @@ Add rols to config for node
 
 ```Elixir
 config :cluster_helper,
-  # all roles of current node. Can add role in runtime.
+  # optional, all roles of current node. Can add role in runtime.
   roles: [:data, :web],
-  # for scope of :syn lib. default scope is ClusterHelper
-  scope: :my_cluster 
+  # optional, for scope of :syn lib. default scope is ClusterHelper
+  scope: :my_cluster ,
+  # optional, default 5_000, timeout for sync between nodes.
+  pull_timeout: 5_000, # ms
+  # optional, default 7_000, time interval for pull from other nodes
+  pull_interval: 10_000 # ms
 ```
+
+If node join/leave cluster other nodes will auto update in pull event.
+
+If add role for node other nodes will received a event for update new role of that node.
 
 Query nodes by role in cluster
 

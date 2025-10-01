@@ -39,7 +39,8 @@ defmodule ClusterHelperTest do
   test "don't remove role of current node" do
     ClusterHelper.add_role(:web)
 
-    Process.sleep( 10_000 ) # need large time for pull in NodeConfig
+    # need large time for pull in NodeConfig
+    Process.sleep(10_000)
 
     assert ClusterHelper.get_my_roles() == [:web]
     assert ClusterHelper.get_roles(Node.self()) == [:web]

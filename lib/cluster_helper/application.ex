@@ -8,7 +8,7 @@ defmodule ClusterHelper.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      ClusterHelper.NodeConfig,
+      ClusterHelper.NodeConfig
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

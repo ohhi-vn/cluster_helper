@@ -103,3 +103,21 @@ ClusterHelper.get_nodes(:role1)
 ## Example
 
 You can get a full example using with EasyRpc lib on [Github](https://github.com/ohhi-vn/lib_examples/tree/main/cluster_helper)
+
+## Support AI agents & MCP
+
+Run this command for update guide & rules from deps to repo for supporting ai agents.
+
+```bash
+mix usage_rules.sync AGENTS.md --all \
+  --link-to-folder deps \
+  --inline usage_rules:all
+```
+
+Run this command for enable MCP server
+
+```bash
+mix tidewave
+```
+
+Config MCP for agent `http://localhost:4112/tidewave/mcp`, changes port in `mix.exs` file if needed. Go to [Tidewave](https://hexdocs.pm/tidewave/) for more informations.

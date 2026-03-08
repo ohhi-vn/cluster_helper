@@ -1,8 +1,10 @@
 # ClusterHelper
 
-This lib is built on top of :syn library, help to manage dynamic Elixir cluster on environment like Kubernetes.
+This library is built on top of :syn library, help to manage dynamic Elixir cluster on environment like Kubernetes.
 Each node has roles like :data, :web, :cache other nodes join to cluster can easy get nodes follow a role in cluster.
 Can use scope for seperating to sub cluster (current version doesn't support overlapped sub cluster).
+
+Library can use with [easy_rpc](https://hex.pm/packages/easy_rpc) for easy to develop an Elixir cluster. 
 
 ## Installation
 
@@ -12,7 +14,7 @@ by adding `cluster_helper` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:cluster_helper, "~0.0.3"}
+    {:cluster_helper, "~> 0.2"}
   ]
 end
 ```
@@ -104,7 +106,7 @@ ClusterHelper.get_nodes(:role1)
 
 You can get a full example using with EasyRpc lib on [Github](https://github.com/ohhi-vn/lib_examples/tree/main/cluster_helper)
 
-## Support AI agents & MCP
+## Support AI agents & MCP for dev
 
 Run this command for update guide & rules from deps to repo for supporting ai agents.
 

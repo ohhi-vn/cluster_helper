@@ -4,7 +4,7 @@ defmodule ClusterHelper.MixProject do
   def project do
     [
       app: :cluster_helper,
-      version: "0.1.0",
+      version: "0.2.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -16,7 +16,8 @@ defmodule ClusterHelper.MixProject do
       docs: docs(),
       description: description(),
       package: package(),
-      aliases: aliases()
+      aliases: aliases(),
+      usage_rules: usage_rules()
     ]
   end
 
@@ -28,15 +29,26 @@ defmodule ClusterHelper.MixProject do
     ]
   end
 
+  # Mix 1.19+ requires CLI preferences to live here, not in project/0.
+  def cli do
+    [
+      preferred_envs: [
+        "test.cluster": :test,
+        "test.all": :test
+      ]
+    ]
+  end
+
+
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:syn, "~> 3.3"},
-      {:ex_doc, "~> 0.38", only: :dev, runtime: false},
-      {:benchee, "~> 1.4", only: :dev},
+      {:syn, "~> 3.4"},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
+      {:benchee, "~> 1.5", only: :dev},
       {:tidewave, "~> 0.5", only: :dev},
-      {:bandit, "~> 1.8", only: :dev},
-      {:usage_rules, "~> 0.1", only: [:dev]}
+      {:bandit, "~> 1.10", only: :dev},
+      {:usage_rules, "~> 1.2", only: [:dev]}
     ]
   end
 
@@ -49,7 +61,7 @@ defmodule ClusterHelper.MixProject do
       maintainers: ["Manh Van Vu"],
       licenses: ["MIT"],
       links: %{
-        "GitHub" => "https://github.com/ohhi-vn/easy_rpc",
+        "GitHub" => "https://github.com/ohhi-vn/cluster_helper",
         "About us" => "https://ohhi.vn/"
       }
     ]
@@ -100,7 +112,29 @@ defmodule ClusterHelper.MixProject do
           --link-to-folder deps
         """
         |> String.trim()
-      ]
+      ],
+
+      # Default `mix test` – skip the real-cluster tests for fast feedback.
+      test: ["test --exclude cluster"],
+
+      # Real-cluster tests only.
+      # `--name` is a VM flag so it must be given to the `elixir` binary, not to
+      # `mix test`. The `cmd` task runs a shell command, letting us prefix with
+      # `elixir --name ... -S mix`.
+      "test.cluster":
+        "cmd elixir --name test@127.0.0.1 -S mix test --only cluster",
+
+      # Full suite (unit + cluster).
+      "test.all":
+        "cmd elixir --name test@127.0.0.1 -S mix test --include cluster",
+
+    ]
+  end
+
+  defp usage_rules do
+    [
+      file: "AGENTS.md",
+      usage_rules: :all
     ]
   end
 end

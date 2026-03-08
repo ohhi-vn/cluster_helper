@@ -1,18 +1,11 @@
 defmodule ClusterHelper.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
 
   use Application
 
   @impl true
   def start(_type, _args) do
-    children = [
-      ClusterHelper.NodeConfig
-    ]
-
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
+    children = [ClusterHelper.NodeConfig]
     opts = [strategy: :one_for_one, name: ClusterHelper.Supervisor]
     Supervisor.start_link(children, opts)
   end

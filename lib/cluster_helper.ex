@@ -1,54 +1,54 @@
+
 defmodule ClusterHelper do
   @moduledoc """
   A helper module for managing dynamic Elixir clusters.
 
-  `ClusterHelper` provides a simple API for managing node roles in a distributed
-  cluster environment. It's built on top of the `:syn` library and is designed
-  to work seamlessly in dynamic cluster environments like Kubernetes.
+  `ClusterHelper` provides a simple, role-based API for tracking nodes in a
+  distributed cluster. It is built on top of the `:syn` library and is designed
+  for dynamic environments such as Kubernetes.
 
   ## Features
 
-  - **Role-based node management**: Assign one or multiple roles to nodes
-  - **Dynamic cluster support**: Automatically discovers and tracks nodes as they join/leave
-  - **Fast lookups**: Uses ETS for efficient role-to-node and node-to-role queries
-  - **Cluster-wide synchronization**: Changes are automatically propagated across the cluster
+  - **Role-based node management** – assign one or more roles to each node
+  - **Dynamic cluster support** – nodes are discovered and tracked automatically
+    as they join or leave the cluster
+  - **Fast lookups** – ETS-backed queries for both role→nodes and node→roles
+  - **Cluster-wide synchronisation** – changes propagate via pub/sub and a
+    configurable periodic pull
 
-  ## Usage
+  ## Quick start
 
-  Add roles to the current node:
-
+      # Tag the current node
       ClusterHelper.add_role(:web)
       ClusterHelper.add_roles([:api, :cache])
 
-  Query nodes by role:
+      # Query the cluster
+      ClusterHelper.get_nodes(:web)        #=> [:"node1@host", :"node2@host"]
+      ClusterHelper.get_roles(:"node1@host") #=> [:web, :api]
+      ClusterHelper.all_nodes()            #=> [:"node1@host", :"node2@host"]
 
-      ClusterHelper.get_nodes(:web)
-      #=> [:node1@host, :node2@host]
+      # Check or remove roles
+      ClusterHelper.get_my_roles()         #=> [:web, :api, :cache]
+      ClusterHelper.remove_role(:cache)
+      ClusterHelper.remove_roles([:api])
 
-  Get all roles for a specific node:
-
-      ClusterHelper.get_roles(:node1@host)
-      #=> [:web, :api]
-
-  Get all nodes in the cluster:
-
-      ClusterHelper.all_nodes()
-      #=> [:node1@host, :node2@host, :node3@host]
-
-  ## Configuration
-
-  Configure in `config/config.exs`:
+  ## Configuration (`config/config.exs`)
 
       config :cluster_helper,
-        # Optional: Initial roles for this node
+        # Roles applied at startup (can also be changed at runtime)
         roles: [:data, :web],
-        # Optional: Scope for :syn library (default: ClusterHelper)
+        # Scope for the :syn library (default: ClusterHelper)
         scope: :my_cluster,
-        # Optional: Timeout for sync between nodes (default: 5_000ms)
+        # Timeout for remote role-pull RPC calls (default: 5_000 ms)
         pull_timeout: 5_000,
-        # Optional: Interval for pulling from other nodes (default: 7_000ms)
+        # Interval between periodic background syncs (default: 7_000 ms)
         pull_interval: 10_000
 
+  ## Notes
+
+  Nodes must first be connected at the Erlang distribution level (e.g. via
+  [libcluster](https://hex.pm/packages/libcluster) or `Node.connect/1`).
+  `ClusterHelper` only tracks *roles* – it does not handle node discovery.
   """
 
   alias ClusterHelper.NodeConfig
@@ -56,196 +56,131 @@ defmodule ClusterHelper do
   @type role :: atom()
   @type node_name :: node()
 
+  # ── Role queries ─────────────────────────────────────────────────────────────
+
   @doc """
-  Returns all nodes in the cluster that have the specified role.
+  Returns every node in the cluster that has been assigned `role`.
 
-  ## Parameters
-
-    * `role` - The role to query for (atom)
-
-  ## Returns
-
-  A list of nodes that have the specified role. Returns an empty list if
-  no nodes have the role.
+  Returns `[]` when no node carries that role.
 
   ## Examples
 
-      # Add a role first, then query
       ClusterHelper.add_role(:web)
       ClusterHelper.get_nodes(:web)
-      # => [:"node1@127.0.0.1"]
+      #=> [:"node1@127.0.0.1"]
 
-      ClusterHelper.get_nodes(:nonexistent_role)
-      # => []
-
+      ClusterHelper.get_nodes(:unknown)
+      #=> []
   """
   @spec get_nodes(role()) :: [node_name()]
-  def get_nodes(role) do
-    NodeConfig.get_nodes(role)
-  end
+  def get_nodes(role), do: NodeConfig.get_nodes(role)
 
   @doc """
-  Returns all roles assigned to the specified node.
+  Returns all roles assigned to `node`.
 
-  ## Parameters
-
-    * `node` - The node to query for (node name)
-
-  ## Returns
-
-  A list of roles assigned to the node. Returns an empty list if the node
-  has no roles or doesn't exist in the cluster.
+  Returns `[]` when the node is unknown or has no roles.
 
   ## Examples
 
-      # Add roles first, then query
       ClusterHelper.add_roles([:web, :api])
       ClusterHelper.get_roles(Node.self())
-      # => [:web, :api]
-
+      #=> [:web, :api]
   """
   @spec get_roles(node_name()) :: [role()]
-  def get_roles(node) do
-    NodeConfig.get_roles(node)
-  end
+  def get_roles(node), do: NodeConfig.get_roles(node)
 
   @doc """
-  Returns all nodes currently in the cluster.
-
-  This returns a deduplicated list of all nodes that have at least one role.
-
-  ## Returns
-
-  A list of all nodes in the cluster.
+  Returns a deduplicated list of every node that has at least one role.
 
   ## Examples
 
       ClusterHelper.all_nodes()
-      # => [:"node1@127.0.0.1", :"node2@127.0.0.1"]
-
+      #=> [:"node1@127.0.0.1", :"node2@127.0.0.1"]
   """
   @spec all_nodes() :: [node_name()]
-  def all_nodes do
-    NodeConfig.get_all_nodes()
-  end
+  def all_nodes(), do: NodeConfig.get_all_nodes()
+
+  # ── Local-node role management ────────────────────────────────────────────────
 
   @doc """
-  Adds a single role to the current node.
+  Returns all roles currently assigned to this node.
 
-  The role is immediately added locally and propagated to all other nodes
-  in the cluster via pub/sub.
+  ## Examples
 
-  ## Parameters
+      ClusterHelper.add_roles([:web, :api])
+      ClusterHelper.get_my_roles()
+      #=> [:web, :api]
+  """
+  @spec get_my_roles() :: [role()]
+  def get_my_roles(), do: NodeConfig.get_my_roles()
 
-    * `role` - The role to add (atom)
+  @doc """
+  Adds `role` to the current node and propagates the change cluster-wide.
 
-  ## Returns
-
-  `:ok`
+  Duplicate roles are silently ignored.
 
   ## Examples
 
       ClusterHelper.add_role(:web)
       ClusterHelper.get_my_roles()
-      # => [:web]
-
+      #=> [:web]
   """
   @spec add_role(role()) :: :ok
-  def add_role(role) do
-    NodeConfig.add_role(role)
-  end
+  def add_role(role), do: NodeConfig.add_role(role)
 
   @doc """
-  Adds multiple roles to the current node.
+  Adds each role in `roles` to the current node and propagates cluster-wide.
 
-  All roles are added atomically and propagated to the cluster together.
-  Duplicate roles are automatically filtered out.
-
-  ## Parameters
-
-    * `roles` - A list of roles to add (list of atoms)
-
-  ## Returns
-
-  `:ok`
+  All new roles are announced in a single pub/sub event. Duplicates are filtered.
 
   ## Examples
 
       ClusterHelper.add_roles([:web, :api, :cache])
       ClusterHelper.get_my_roles()
-      # => [:web, :api, :cache]
-
+      #=> [:web, :api, :cache]
   """
   @spec add_roles([role()]) :: :ok
-  def add_roles(roles) do
-    NodeConfig.add_roles(roles)
-  end
+  def add_roles(roles), do: NodeConfig.add_roles(roles)
 
   @doc """
-  Returns all roles assigned to the current node.
-
-  ## Returns
-
-  A list of roles for the current node.
-
-  ## Examples
-
-      ClusterHelper.add_roles([:web, :api])
-      ClusterHelper.get_my_roles()
-      # => [:web, :api]
-
-  """
-  @spec get_my_roles() :: [role()]
-  def get_my_roles do
-    NodeConfig.get_my_roles()
-  end
-
-  @doc """
-  Removes a single role from the current node.
-
-  The role is immediately removed locally and the change is propagated
-  to all other nodes in the cluster.
-
-  ## Parameters
-
-    * `role` - The role to remove (atom)
-
-  ## Returns
-
-  `:ok`
+  Removes `role` from the current node and propagates the change cluster-wide.
 
   ## Examples
 
       ClusterHelper.add_roles([:web, :api])
       ClusterHelper.remove_role(:api)
       ClusterHelper.get_my_roles()
-      # => [:web]
-
+      #=> [:web]
   """
   @spec remove_role(role()) :: :ok
-  def remove_role(role) do
-    NodeConfig.remove_role(role)
-  end
+  def remove_role(role), do: NodeConfig.remove_role(role)
 
   @doc """
-  Check is is local node.
-
-  ## Parameters
-
-    * `node` - A node name.
-
-  ## Returns
-
-  `true|false`
+  Removes each role in `roles` from the current node and propagates cluster-wide.
 
   ## Examples
 
-      ClusterHelper.local_node?(:"node1@127.0.0.1")
-      # => true
-
+      ClusterHelper.add_roles([:web, :api, :cache])
+      ClusterHelper.remove_roles([:api, :cache])
+      ClusterHelper.get_my_roles()
+      #=> [:web]
   """
-  @spec local_node?([atom]) :: :ok
-  def local_node?(node) do
-    NodeConfig.local_node?(node)
-  end
+  @spec remove_roles([role()]) :: :ok
+  def remove_roles(roles), do: NodeConfig.remove_roles(roles)
+
+  # ── Utility ───────────────────────────────────────────────────────────────────
+
+  @doc """
+  Returns `true` when `node` is the local node, `false` otherwise.
+
+  ## Examples
+
+      ClusterHelper.local_node?(Node.self())
+      #=> true
+
+      ClusterHelper.local_node?(:"other@127.0.0.1")
+      #=> false
+  """
+  @spec local_node?(node_name()) :: boolean()
+  def local_node?(node), do: NodeConfig.local_node?(node)
 end

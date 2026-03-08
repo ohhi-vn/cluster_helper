@@ -1,3 +1,6 @@
+[![Docs](https://img.shields.io/badge/api-docs-green.svg?style=flat)](https://hexdocs.pm/cluster_helper)
+[![Hex.pm](https://img.shields.io/hexpm/v/super_cache.svg?style=flat&color=blue)](https://hex.pm/packages/cluster_helper)
+
 # ClusterHelper
 
 This library is built on top of :syn library, help to manage dynamic Elixir cluster on environment like Kubernetes.

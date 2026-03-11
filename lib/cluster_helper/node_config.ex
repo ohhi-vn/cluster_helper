@@ -1,4 +1,3 @@
-
 defmodule ClusterHelper.NodeConfig do
   @moduledoc """
   GenServer that owns the ETS role/node table and coordinates cluster sync.
@@ -6,13 +5,15 @@ defmodule ClusterHelper.NodeConfig do
   ## Responsibilities
 
   - Maintains an ETS `:bag` table keyed on `{:role, role}` and `{:node, node}`
-    for O(1) lookups in either direction.
+    for O(1) lookups in either direction. Roles may be any Elixir term.
   - Registers this node in a `:syn` group so the `SynEventHandler` is notified
     of remote node arrivals/departures.
   - On startup, pulls the current role state from every already-connected node.
   - Publishes incremental add/remove events so remote nodes stay up-to-date
     without waiting for the next periodic pull.
   - Periodically re-syncs to recover from lost messages or transient failures.
+  - Invokes the optional `ClusterHelper.EventHandler` callbacks when roles or
+    nodes are first added to the local ETS table.
 
   ## Internal message protocol
 
@@ -32,6 +33,7 @@ defmodule ClusterHelper.NodeConfig do
 
   alias :ets, as: Ets
   alias :syn, as: Syn
+  alias ClusterHelper.EventHandler
 
   @ets_table __MODULE__
   @default_interval 7_000
@@ -42,10 +44,10 @@ defmodule ClusterHelper.NodeConfig do
   @spec start_link(any()) :: GenServer.on_start()
   def start_link(_), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
 
-  @spec get_my_roles() :: [atom()]
+  @spec get_my_roles() :: [ClusterHelper.role()]
   def get_my_roles(), do: GenServer.call(__MODULE__, :get_my_roles)
 
-  @spec get_nodes(atom()) :: [node()]
+  @spec get_nodes(ClusterHelper.role()) :: [node()]
   def get_nodes(role) do
     @ets_table
     |> Ets.lookup({:role, role})
@@ -58,23 +60,24 @@ defmodule ClusterHelper.NodeConfig do
     |> Enum.uniq()
   end
 
-  @spec get_roles(node()) :: [atom()]
+  @spec get_roles(node()) :: [ClusterHelper.role()]
   def get_roles(node) do
     @ets_table
     |> Ets.lookup({:node, node})
     |> Enum.map(fn {_key, role} -> role end)
   end
 
-  @spec add_role(atom()) :: :ok
-  def add_role(role) when is_atom(role), do: GenServer.call(__MODULE__, {:add_roles, [role]})
+  # Guards are removed — roles can be any Elixir term.
+  @spec add_role(ClusterHelper.role()) :: :ok
+  def add_role(role), do: GenServer.call(__MODULE__, {:add_roles, [role]})
 
-  @spec add_roles([atom()]) :: :ok
+  @spec add_roles([ClusterHelper.role()]) :: :ok
   def add_roles(roles) when is_list(roles), do: GenServer.call(__MODULE__, {:add_roles, roles})
 
-  @spec remove_role(atom()) :: :ok
-  def remove_role(role) when is_atom(role), do: GenServer.call(__MODULE__, {:remove_roles, [role]})
+  @spec remove_role(ClusterHelper.role()) :: :ok
+  def remove_role(role), do: GenServer.call(__MODULE__, {:remove_roles, [role]})
 
-  @spec remove_roles([atom()]) :: :ok
+  @spec remove_roles([ClusterHelper.role()]) :: :ok
   def remove_roles(roles) when is_list(roles), do: GenServer.call(__MODULE__, {:remove_roles, roles})
 
   # These remain casts — they are triggered by external events (syn callbacks)
@@ -136,7 +139,7 @@ defmodule ClusterHelper.NodeConfig do
     {:noreply, %{state | roles: roles}}
   end
 
-  # ── Casts ─────────────────────────────────────────────────────────────────────
+  # ── Calls ─────────────────────────────────────────────────────────────────────
 
   @impl true
   def handle_call({:add_roles, new_roles}, _from, state) do
@@ -161,9 +164,9 @@ defmodule ClusterHelper.NodeConfig do
 
   def handle_call(:get_my_roles, _from, state), do: {:reply, state.roles, state}
 
+  # ── Casts ─────────────────────────────────────────────────────────────────────
 
   # Triggered by SynEventHandler when a remote scope node comes up.
-  # Kicks off an async pull; the result is delivered via handle_info/2.
   @impl true
   def handle_cast({:pull_from_node, remote_node}, state) do
     async_pull_node(remote_node, :pull_new_node)
@@ -186,9 +189,6 @@ defmodule ClusterHelper.NodeConfig do
   end
 
   # A remote node published that it came online — pull its roles.
-  # (This is complementary to the SynEventHandler path; the pub/sub message
-  # arrives once the node has joined :all_nodes, whereas the syn event fires
-  # earlier at scope node-up. Both paths are idempotent.)
   def handle_info({:new_node, remote_node, _pid}, state) do
     if remote_node != Node.self() do
       async_pull_node(remote_node, :pull_new_node)
@@ -218,14 +218,16 @@ defmodule ClusterHelper.NodeConfig do
   end
 
   # Full-sync result: replace stale data for a known node (periodic pull).
+  # No on_node_added callback here — the node was already known.
   def handle_info({:pull_update_node, remote_node, roles}, state) do
     remove_node_entry(remote_node)
     add_roles_for_node(remote_node, roles)
     {:noreply, state}
   end
 
-  # Add roles for a newly discovered node (first-time pull).
+  # First-time pull for a newly discovered node — fire on_node_added callback.
   def handle_info({:pull_new_node, remote_node, roles}, state) do
+    EventHandler.dispatch_node_added(remote_node)
     add_roles_for_node(remote_node, roles)
     {:noreply, state}
   end
@@ -235,13 +237,13 @@ defmodule ClusterHelper.NodeConfig do
     {:noreply, state}
   end
 
-
   # ── Private helpers ───────────────────────────────────────────────────────────
 
-  # Add a single role for any node into ETS.
+  # Add a single role for any node into ETS, then fire the callback.
   defp add_role_entry(node, role) do
     Ets.insert(@ets_table, {{:role, role}, node})
     Ets.insert(@ets_table, {{:node, node}, role})
+    EventHandler.dispatch_role_added(node, role)
   end
 
   # Add a single role for the *local* node (also joins the syn group).
@@ -290,7 +292,6 @@ defmodule ClusterHelper.NodeConfig do
   end
 
   # Perform a full sync against every live node that `:syn` knows about.
-  # Also evicts any node that has left the cluster.
   defp pull_roles_from_cluster do
     current_node = Node.self()
 
@@ -300,10 +301,8 @@ defmodule ClusterHelper.NodeConfig do
       |> Enum.map(fn {_pid, node} -> node end)
       |> Enum.reject(&(&1 == current_node))
 
-    # Pull from every live node (full-sync, so we use :pull_update_node).
     Enum.each(live_nodes, &async_pull_node(&1, :pull_update_node))
 
-    # Evict nodes that no longer appear in the syn membership list.
     stale_nodes = get_all_nodes() -- [current_node | live_nodes]
 
     Enum.each(stale_nodes, fn node ->

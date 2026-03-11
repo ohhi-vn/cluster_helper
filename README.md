@@ -71,6 +71,28 @@ ClusterHelper.get_roles(:node1)
 # [:data, :web]
 ```
 
+Support for adding callback to trigger new role or node.
+
+```elixir
+# config/config.exs
+config :cluster_helper, event_handler: MyApp.ClusterEvents
+
+# lib/my_app/cluster_events.ex
+defmodule MyApp.ClusterEvents do
+  @behaviour ClusterHelper.EventHandler
+
+  @impl true
+  def on_role_added(node, role) do
+    Logger.info("#{node} gained role #{inspect(role)}")
+  end
+
+  @impl true
+  def on_node_added(node) do
+    Phoenix.PubSub.broadcast(MyApp.PubSub, "cluster", {:node_up, node})
+  end
+end
+```
+
 ## Test local cluster without integrated with other app
 
 Start 2 nodes

@@ -1,4 +1,3 @@
-
 defmodule ClusterHelper do
   @moduledoc """
   A helper module for managing dynamic Elixir clusters.
@@ -7,42 +6,50 @@ defmodule ClusterHelper do
   distributed cluster. It is built on top of the `:syn` library and is designed
   for dynamic environments such as Kubernetes.
 
+  Note: Collab between human & AI.
+
   ## Features
 
-  - **Role-based node management** – assign one or more roles to each node
+  - **Role-based node management** – assign one or more roles to each node;
+    roles can be any Elixir term (atom, string, tuple, …)
   - **Dynamic cluster support** – nodes are discovered and tracked automatically
     as they join or leave the cluster
   - **Fast lookups** – ETS-backed queries for both role→nodes and node→roles
   - **Cluster-wide synchronisation** – changes propagate via pub/sub and a
     configurable periodic pull
+  - **Event callbacks** – optional `ClusterHelper.EventHandler` behaviour
+    notifies your code when roles or nodes are added
 
   ## Quick start
 
       # Tag the current node
       ClusterHelper.add_role(:web)
-      ClusterHelper.add_roles([:api, :cache])
+      ClusterHelper.add_roles([:api, "cache", {:shard, 1}])
 
       # Query the cluster
-      ClusterHelper.get_nodes(:web)        #=> [:"node1@host", :"node2@host"]
-      ClusterHelper.get_roles(:"node1@host") #=> [:web, :api]
-      ClusterHelper.all_nodes()            #=> [:"node1@host", :"node2@host"]
+      ClusterHelper.get_nodes(:web)              #=> [:"node1@host", :"node2@host"]
+      ClusterHelper.get_roles(:"node1@host")     #=> [:web, :api]
+      ClusterHelper.all_nodes()                  #=> [:"node1@host", :"node2@host"]
 
       # Check or remove roles
-      ClusterHelper.get_my_roles()         #=> [:web, :api, :cache]
-      ClusterHelper.remove_role(:cache)
-      ClusterHelper.remove_roles([:api])
+      ClusterHelper.get_my_roles()               #=> [:web, :api, "cache", {:shard, 1}]
+      ClusterHelper.remove_role("cache")
+      ClusterHelper.remove_roles([{:shard, 1}])
 
   ## Configuration (`config/config.exs`)
 
       config :cluster_helper,
-        # Roles applied at startup (can also be changed at runtime)
+        # Roles applied at startup (can also be changed at runtime).
+        # Any Elixir term is a valid role.
         roles: [:data, :web],
         # Scope for the :syn library (default: ClusterHelper)
         scope: :my_cluster,
         # Timeout for remote role-pull RPC calls (default: 5_000 ms)
         pull_timeout: 5_000,
         # Interval between periodic background syncs (default: 7_000 ms)
-        pull_interval: 10_000
+        pull_interval: 10_000,
+        # Optional event-handler module implementing ClusterHelper.EventHandler
+        event_handler: MyApp.ClusterEvents
 
   ## Notes
 
@@ -53,7 +60,8 @@ defmodule ClusterHelper do
 
   alias ClusterHelper.NodeConfig
 
-  @type role :: atom()
+  # Roles can be any Elixir term.
+  @type role :: term()
   @type node_name :: node()
 
   # ── Role queries ─────────────────────────────────────────────────────────────
@@ -61,7 +69,7 @@ defmodule ClusterHelper do
   @doc """
   Returns every node in the cluster that has been assigned `role`.
 
-  Returns `[]` when no node carries that role.
+  `role` can be any Elixir term. Returns `[]` when no node carries that role.
 
   ## Examples
 
@@ -69,7 +77,7 @@ defmodule ClusterHelper do
       ClusterHelper.get_nodes(:web)
       #=> [:"node1@127.0.0.1"]
 
-      ClusterHelper.get_nodes(:unknown)
+      ClusterHelper.get_nodes({:shard, 1})
       #=> []
   """
   @spec get_nodes(role()) :: [node_name()]
@@ -82,9 +90,9 @@ defmodule ClusterHelper do
 
   ## Examples
 
-      ClusterHelper.add_roles([:web, :api])
+      ClusterHelper.add_roles([:web, {:shard, 2}])
       ClusterHelper.get_roles(Node.self())
-      #=> [:web, :api]
+      #=> [:web, {:shard, 2}]
   """
   @spec get_roles(node_name()) :: [role()]
   def get_roles(node), do: NodeConfig.get_roles(node)
@@ -107,9 +115,9 @@ defmodule ClusterHelper do
 
   ## Examples
 
-      ClusterHelper.add_roles([:web, :api])
+      ClusterHelper.add_roles([:web, "api"])
       ClusterHelper.get_my_roles()
-      #=> [:web, :api]
+      #=> [:web, "api"]
   """
   @spec get_my_roles() :: [role()]
   def get_my_roles(), do: NodeConfig.get_my_roles()
@@ -117,13 +125,14 @@ defmodule ClusterHelper do
   @doc """
   Adds `role` to the current node and propagates the change cluster-wide.
 
-  Duplicate roles are silently ignored.
+  `role` can be any Elixir term. Duplicate roles are silently ignored.
 
   ## Examples
 
       ClusterHelper.add_role(:web)
+      ClusterHelper.add_role({:shard, 1})
       ClusterHelper.get_my_roles()
-      #=> [:web]
+      #=> [:web, {:shard, 1}]
   """
   @spec add_role(role()) :: :ok
   def add_role(role), do: NodeConfig.add_role(role)
@@ -132,12 +141,13 @@ defmodule ClusterHelper do
   Adds each role in `roles` to the current node and propagates cluster-wide.
 
   All new roles are announced in a single pub/sub event. Duplicates are filtered.
+  Roles can be any Elixir term.
 
   ## Examples
 
-      ClusterHelper.add_roles([:web, :api, :cache])
+      ClusterHelper.add_roles([:web, "api", {:shard, 1}])
       ClusterHelper.get_my_roles()
-      #=> [:web, :api, :cache]
+      #=> [:web, "api", {:shard, 1}]
   """
   @spec add_roles([role()]) :: :ok
   def add_roles(roles), do: NodeConfig.add_roles(roles)
@@ -147,8 +157,8 @@ defmodule ClusterHelper do
 
   ## Examples
 
-      ClusterHelper.add_roles([:web, :api])
-      ClusterHelper.remove_role(:api)
+      ClusterHelper.add_roles([:web, "api"])
+      ClusterHelper.remove_role("api")
       ClusterHelper.get_my_roles()
       #=> [:web]
   """
@@ -160,8 +170,8 @@ defmodule ClusterHelper do
 
   ## Examples
 
-      ClusterHelper.add_roles([:web, :api, :cache])
-      ClusterHelper.remove_roles([:api, :cache])
+      ClusterHelper.add_roles([:web, "api", {:shard, 1}])
+      ClusterHelper.remove_roles(["api", {:shard, 1}])
       ClusterHelper.get_my_roles()
       #=> [:web]
   """

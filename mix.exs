@@ -4,7 +4,7 @@ defmodule ClusterHelper.MixProject do
   def project do
     [
       app: :cluster_helper,
-      version: "0.2.1",
+      version: "0.3.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -53,7 +53,7 @@ defmodule ClusterHelper.MixProject do
   end
 
   defp description() do
-    "A library for dynamic cluster like Kubernetes. Easy to get nodes by role for calling RPC."
+    "A library for dynamic clustering inspired by Kubernetes. It allows you to easily select nodes by role and perform RPC calls."
   end
 
   defp package() do
@@ -69,7 +69,7 @@ defmodule ClusterHelper.MixProject do
 
   defp docs do
     [
-      main: "readme",
+      main: "README",
       extras: extras()
     ]
   end

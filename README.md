@@ -3,9 +3,9 @@
 
 # ClusterHelper
 
-This library is built on top of :syn library, help to manage dynamic Elixir cluster on environment like Kubernetes.
-Each node has roles like :data, :web, :cache other nodes join to cluster can easy get nodes follow a role in cluster.
-Can use scope for seperating to sub cluster (current version doesn't support overlapped sub cluster).
+This library is built on OTP's `:pg` (Process Groups) and `:net_kernel` modules to manage dynamic Elixir clusters in environments like Kubernetes.
+Each node has roles like `:data`, `:web`, `:cache` and other nodes joining the cluster can easily get nodes by role.
+A configurable scope allows separation into sub-clusters with full isolation between them.
 
 Library can use with [easy_rpc](https://hex.pm/packages/easy_rpc) for easy to develop an Elixir cluster. 
 
@@ -43,8 +43,8 @@ Add rols to config for node
 config :cluster_helper,
   # optional, all roles of current node. Can add role in runtime.
   roles: [:data, :web],
-  # optional, for scope of :syn lib. default scope is ClusterHelper
-  scope: :my_cluster ,
+  # optional, scope for :pg module. default scope is ClusterHelper
+  scope: :my_cluster,
   # optional, default 5_000, timeout for sync between nodes.
   pull_timeout: 5_000, # ms
   # optional, default 7_000, time interval for pull from other nodes
@@ -93,38 +93,88 @@ defmodule MyApp.ClusterEvents do
 end
 ```
 
-## Test local cluster without integrated with other app
+## Testing
 
-Start 2 nodes
+### Running Tests
 
-Start node1:
-
-```bash
-iex --name node1@127.0.0.1 --cookie need_to_change_this -S mix
-```
+ClusterHelper has three tiers of tests. **Unit tests run by default**; cluster and scale tests require a distributed Erlang node (`--name`).
 
 ```bash
-iex --name node2@127.0.0.1 --cookie need_to_change_this -S mix
+# 1. Unit tests only (fast, no distribution needed)
+mix test
+
+# 2. Cluster tests only (2-node convergence, requires --name)
+mix test.cluster
+
+# 3. Multi-node scale tests (20+ nodes, requires --name)
+mix test.multi_node_scale
+
+# 4. All tests – unit + cluster + scale
+mix test.all
 ```
 
-Join & Verify all nodes by run cmd in node2 shell:
+### Test Suites
 
-```Elixir
+| Suite | Tag | Nodes | What it tests |
+|---|---|---|---|
+| **Unit** | (default) | 1 (nonode) | Role CRUD, ETS consistency, event handlers, duplicate handling, any-type roles |
+| **Cluster** | `:cluster` | 2-3 | Node join discovery, live role propagation, node departure cleanup, 3-node convergence |
+| **Multi-Node Scale** | `:multi_node_scale` | 10-20+ | 20-node boot, role convergence, rapid churn waves, partial failure, scope isolation across nodes |
+
+### Manual Cluster Testing
+
+Start two nodes to test role sync manually:
+
+```bash
+# Terminal 1
+iex --name node1@127.0.0.1 --cookie test_cookie -S mix
+
+# Terminal 2
+iex --name node2@127.0.0.1 --cookie test_cookie -S mix
+```
+
+In node2's shell, connect and verify:
+
+```elixir
+# Connect to node1
 Node.connect(:"node1@127.0.0.1")
-
 Node.list()
+#=> [:"node1@127.0.0.1"]
+
+# Add roles on both nodes
+ClusterHelper.add_roles([:web, :api])
+
+# Query roles across the cluster
+ClusterHelper.get_nodes(:web)
+#=> [:"node1@127.0.0.1", :"node2@127.0.0.1"]
+
+ClusterHelper.get_roles(:"node1@127.0.0.1")
+#=> [:web, :api]
 ```
 
-In each iex shell add rule by cmd:
+### Overlapping Scopes
 
-```Elixir
-ClusterHelper.add_roles([:role1, :role2])
-```
+Test scope isolation with multiple scopes on the same nodes:
 
-Verify data synced by cmd:
+```elixir
+# Join additional scopes
+ClusterHelper.join_scope(:frontend)
+ClusterHelper.join_scope(:backend)
 
-```Elixir
-ClusterHelper.get_nodes(:role1)
+# Add different roles per scope
+ClusterHelper.add_role(:nginx, :frontend)
+ClusterHelper.add_role(:postgres, :backend)
+
+# Scopes are fully isolated
+ClusterHelper.get_nodes(:nginx, :frontend)
+#=> [:"node1@127.0.0.1", :"node2@127.0.0.1"]
+
+ClusterHelper.get_nodes(:nginx, :backend)
+#=> []
+
+# List active scopes
+ClusterHelper.list_scopes()
+#=> [ClusterHelper, :frontend, :backend]
 ```
 
 ## Example

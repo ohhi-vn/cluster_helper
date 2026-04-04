@@ -4,7 +4,7 @@ defmodule ClusterHelper.MixProject do
   def project do
     [
       app: :cluster_helper,
-      version: "0.3.0",
+      version: "0.4.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -24,7 +24,7 @@ defmodule ClusterHelper.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger, :syn],
+      extra_applications: [:logger],
       mod: {ClusterHelper.Application, []}
     ]
   end
@@ -34,6 +34,7 @@ defmodule ClusterHelper.MixProject do
     [
       preferred_envs: [
         "test.cluster": :test,
+        "test.multi_node_scale": :test,
         "test.all": :test
       ]
     ]
@@ -43,7 +44,6 @@ defmodule ClusterHelper.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:syn, "~> 3.4"},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
       {:benchee, "~> 1.5", only: :dev},
       {:tidewave, "~> 0.5", only: :dev},
@@ -53,12 +53,12 @@ defmodule ClusterHelper.MixProject do
   end
 
   defp description() do
-    "A library for dynamic clustering inspired by Kubernetes. It allows you to easily select nodes by role and perform RPC calls."
+    "A library for lookup node(s) in dynamic clustering. Map node to roles or id and allows you to easily select node(s) by role/id."
   end
 
   defp package() do
     [
-      maintainers: ["Manh Van Vu"],
+      maintainers: ["Manh Vu"],
       licenses: ["MIT"],
       links: %{
         "GitHub" => "https://github.com/ohhi-vn/cluster_helper",
@@ -117,16 +117,20 @@ defmodule ClusterHelper.MixProject do
       # Default `mix test` – skip the real-cluster tests for fast feedback.
       test: ["test --exclude cluster"],
 
-      # Real-cluster tests only.
+      # Real-cluster tests only (2-3 nodes).
       # `--name` is a VM flag so it must be given to the `elixir` binary, not to
       # `mix test`. The `cmd` task runs a shell command, letting us prefix with
       # `elixir --name ... -S mix`.
       "test.cluster":
         "cmd elixir --name test@127.0.0.1 -S mix test --only cluster",
 
-      # Full suite (unit + cluster).
+      # Multi-node scale tests (10-20+ nodes with churn simulation).
+      "test.multi_node_scale":
+        "cmd elixir --name test@127.0.0.1 -S mix test --only multi_node_scale",
+
+      # Full suite – unit + cluster + multi-node scale.
       "test.all":
-        "cmd elixir --name test@127.0.0.1 -S mix test --include cluster",
+        "cmd elixir --name test@127.0.0.1 -S mix test --include cluster --include multi_node_scale",
 
     ]
   end

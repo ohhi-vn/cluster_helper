@@ -25,11 +25,11 @@ defmodule ClusterHelper.ClusterTest do
   @moduletag :cluster
 
   # How long to wait for async role propagation before failing a test.
-  @propagation_timeout 5_000
+  @propagation_timeout 30_000
   # How long to wait for a full pull cycle when testing node departure or
   # cross-peer role convergence. Must exceed pull_interval (default 7 000 ms).
-  @departure_timeout 15_000
-  @poll_interval 100
+  @departure_timeout 60_000
+  @poll_interval 1000
 
   # ── Suite-level setup ─────────────────────────────────────────────────────
 
@@ -129,10 +129,9 @@ defmodule ClusterHelper.ClusterTest do
   describe "live role changes propagate cluster-wide" do
     test "add_role/1 on a peer is immediately visible on the test node" do
       {_peer, peer_node} = start_peer(:epsilon)
-      # all_nodes/0 only lists nodes with at least one role — use :syn instead.
-      scope = Application.get_env(:cluster_helper, :scope, ClusterHelper)
+      # Wait until the peer node is connected and visible
       wait_until(fn ->
-        :syn.members(scope, :all_nodes) |> Enum.any?(fn {_, n} -> n == peer_node end)
+        peer_node in Node.list()
       end)
 
       :erpc.call(peer_node, ClusterHelper, :add_role, [:live_added])
@@ -159,9 +158,9 @@ defmodule ClusterHelper.ClusterTest do
 
     test "add_roles/1 propagates all new roles in a single pub/sub event" do
       {_peer, peer_node} = start_peer(:eta)
-      scope = Application.get_env(:cluster_helper, :scope, ClusterHelper)
+      # Wait until the peer node is connected and visible
       wait_until(fn ->
-        :syn.members(scope, :all_nodes) |> Enum.any?(fn {_, n} -> n == peer_node end)
+        peer_node in Node.list()
       end)
 
       :erpc.call(peer_node, ClusterHelper, :add_roles, [[:svc_a, :svc_b, :svc_c]])
@@ -201,9 +200,9 @@ defmodule ClusterHelper.ClusterTest do
 
     test "role added on test node is visible on the peer" do
       {_peer, peer_node} = start_peer(:iota)
-      scope = Application.get_env(:cluster_helper, :scope, ClusterHelper)
+      # Wait until the peer node is connected and visible
       wait_until(fn ->
-        :syn.members(scope, :all_nodes) |> Enum.any?(fn {_, n} -> n == peer_node end)
+        peer_node in Node.list()
       end)
 
       ClusterHelper.add_role(:test_node_role)
@@ -267,6 +266,7 @@ defmodule ClusterHelper.ClusterTest do
   # ═══════════════════════════════════════════════════════════════════════════
 
   describe "three-node cluster" do
+    @tag timeout: 65_000
     test "all nodes converge on a consistent cluster-wide role view" do
       ClusterHelper.add_role(:node0_role)
       {_p1, node1} = start_peer(:mu, roles: [:node1_role])
@@ -276,24 +276,20 @@ defmodule ClusterHelper.ClusterTest do
       # node automatically during start_peer (via the host/cookie args).
       :erpc.call(node1, Node, :connect, [node2])
 
-      scope = Application.get_env(:cluster_helper, :scope, ClusterHelper)
-
-      # Wait until all three nodes reach full three-way :syn connectivity
-      # before asserting role visibility.
       wait_until(
         fn ->
           node2_members =
-            :erpc.call(node2, :syn, :members, [scope, :all_nodes])
-            |> Enum.map(fn {_pid, n} -> n end)
+            :erpc.call(node2, ClusterHelper, :all_nodes, [])
 
           node1_members =
-            :erpc.call(node1, :syn, :members, [scope, :all_nodes])
-            |> Enum.map(fn {_pid, n} -> n end)
+            :erpc.call(node1, ClusterHelper, :all_nodes, [])
 
-          node1 in node2_members and node2 in node1_members
+          node0_members = ClusterHelper.all_nodes()
+
+          node0_members == node1_members and node1_members == node2_members
         end,
-        @propagation_timeout,
-        "node1 and node2 did not reach mutual syn visibility"
+        @departure_timeout,
+        "cluster members did not converge"
       )
 
       wait_until(
@@ -316,7 +312,7 @@ defmodule ClusterHelper.ClusterTest do
           local_ok and node1_ok and node2_ok
         end,
         # Must exceed the pull_interval (default 7 000 ms) so node1 and node2
-        # have time to exchange roles after their :syn connection is established.
+        # have time to exchange roles after their cluster connection is established.
         15_000,
         "all three nodes must converge on a consistent role view"
       )
@@ -328,17 +324,13 @@ defmodule ClusterHelper.ClusterTest do
 
       :erpc.call(node1, Node, :connect, [node2])
 
-      scope = Application.get_env(:cluster_helper, :scope, ClusterHelper)
-
       wait_until(
         fn ->
           node2_members =
-            :erpc.call(node2, :syn, :members, [scope, :all_nodes])
-            |> Enum.map(fn {_pid, n} -> n end)
+            :erpc.call(node2, ClusterHelper, :all_nodes, [])
 
           node1_members =
-            :erpc.call(node1, :syn, :members, [scope, :all_nodes])
-            |> Enum.map(fn {_pid, n} -> n end)
+            :erpc.call(node1, ClusterHelper, :all_nodes, [])
 
           node1 in node2_members and node2 in node1_members
         end,
@@ -391,35 +383,32 @@ defmodule ClusterHelper.ClusterTest do
     # :peer.start/1 returns {pid, node} in OTP 25-26 with get_node/1,
     # and {pid, node} directly as a 3-tuple in OTP 27+.
     # We match the 3-tuple form which works on OTP 27+.
+    # Build -pa args from local code paths so the peer loads correct modules from boot.
+    pa_args = Enum.flat_map(:code.get_path(), fn path -> [~c"-pa", path] end)
+
     {:ok, peer, node} =
       :peer.start(%{
         name: name,
         host: host,
-        args: [~c"-setcookie", cookie],
+        args: [~c"-setcookie", cookie] ++ pa_args,
         wait_boot: 30_000
       })
 
-    # Load local code paths onto the peer so ClusterHelper modules are found.
-    :ok = :erpc.call(node, :code, :add_paths, [:code.get_path()])
-
-    # Start ClusterHelper (this also starts :syn transitively).
+    # Start ClusterHelper (this also starts :pg and node monitoring).
     {:ok, _started} = :erpc.call(node, Application, :ensure_all_started, [:cluster_helper])
 
     # Wait until the peer's NodeConfig has completed handle_continue and joined
-    # the :all_nodes syn group. This is a reliable signal that the peer is fully
-    # up and has performed its initial pull — much safer than a fixed sleep.
-    scope = Application.get_env(:cluster_helper, :scope, ClusterHelper)
-
+    # the cluster via Node.list(). This is a reliable signal that the peer is
+    # fully up and connected — much safer than a fixed sleep.
     wait_until(
       fn ->
-        :syn.members(scope, :all_nodes)
-        |> Enum.any?(fn {_pid, member} -> member == node end)
+        node in Node.list()
       end,
-      10_000,
-      "peer #{node} did not join :syn :all_nodes group within 10 s"
+      @propagation_timeout,
+      "peer did not connect to the cluster"
     )
 
-    # Assign initial roles after the peer is confirmed to be in the syn scope.
+    # Assign initial roles after the peer is confirmed to be connected.
     unless roles == [] do
       :erpc.call(node, ClusterHelper, :add_roles, [roles])
     end

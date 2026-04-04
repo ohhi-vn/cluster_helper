@@ -26,7 +26,6 @@
   "sourceror": {:hex, :sourceror, "1.12.0", "da354c5f35aad3cc1132f5d5b0d8437d865e2661c263260480bab51b5eedb437", [:mix], [], "hexpm", "755703683bd014ebcd5de9acc24b68fb874a660a568d1d63f8f98cd8a6ef9cd0"},
   "spitfire": {:hex, :spitfire, "0.3.10", "19aea9914132456515e8f7d592f63ab9f3130876b0252e834d2390bdd8becb24", [:mix], [], "hexpm", "6a6a5f77eb4165249c76199cd2d01fb595bac9207aed3de551918ac1c2bc9267"},
   "statistex": {:hex, :statistex, "1.1.0", "7fec1eb2f580a0d2c1a05ed27396a084ab064a40cfc84246dbfb0c72a5c761e5", [:mix], [], "hexpm", "f5950ea26ad43246ba2cce54324ac394a4e7408fdcf98b8e230f503a0cba9cf5"},
-  "syn": {:hex, :syn, "3.4.0", "cc16c2107bef0a729f96e95827def83e6a8d078d643f822e49419b153d475112", [:rebar3], [], "hexpm", "69e30a2181c11211791183aad148975adc6e4b3ec9718510e5ea42cf5d73de9d"},
   "telemetry": {:hex, :telemetry, "1.4.0", "69aa83d53f152f93f05fd40b77ded6fab247de093b7a3c4ca2879e634144446e", [:rebar3], [], "hexpm", "d1ff426f988ac1092f9d684d34d08e51042a70567c16be793fbc8f399fd2e77d"},
   "text_diff": {:hex, :text_diff, "0.1.0", "1caf3175e11a53a9a139bc9339bd607c47b9e376b073d4571c031913317fecaa", [:mix], [], "hexpm", "d1ffaaecab338e49357b6daa82e435f877e0649041ace7755583a0ea3362dbd7"},
   "thousand_island": {:hex, :thousand_island, "1.4.3", "2158209580f633be38d43ec4e3ce0a01079592b9657afff9080d5d8ca149a3af", [:mix], [{:telemetry, "~> 0.4 or ~> 1.0", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "6e4ce09b0fd761a58594d02814d40f77daff460c48a7354a15ab353bb998ea0b"},

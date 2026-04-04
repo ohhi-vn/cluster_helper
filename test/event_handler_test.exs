@@ -207,6 +207,8 @@ defmodule ClusterHelper.NodeConfigCallbackIntegrationTest do
     Application.put_env(:cluster_helper, :event_handler, IntegrationCollector)
 
     # Clean up any roles left by the previous test.
+    # Wait for GenServer to be ready (may be busy processing async tasks from prior tests).
+    wait_for_gen_server()
     ClusterHelper.get_my_roles() |> Enum.each(&ClusterHelper.remove_role/1)
 
     on_exit(fn ->
@@ -241,19 +243,19 @@ defmodule ClusterHelper.NodeConfigCallbackIntegrationTest do
 
   test "on_role_added fires when a remote node's roles are received via pub/sub" do
     remote = :"fake_remote@127.0.0.1"
-    send(NodeConfig, {:new_roles, [:cache], remote})
+    send(NodeConfig, {:new_roles, ClusterHelper, [:cache], remote})
     assert_receive {:callback, :role_added, ^remote, :cache}, 500
   end
 
   test "on_node_added fires when a new remote node is pulled for the first time" do
     remote = :"new_remote@127.0.0.1"
-    send(NodeConfig, {:pull_new_node, remote, [:data]})
+    send(NodeConfig, {:pull_new_node, ClusterHelper, remote, [:data]})
     assert_receive {:callback, :node_added, ^remote}, 500
   end
 
   test "on_node_added does NOT fire on periodic resync (pull_update_node)" do
     remote = :"known_remote@127.0.0.1"
-    send(NodeConfig, {:pull_update_node, remote, [:data]})
+    send(NodeConfig, {:pull_update_node, ClusterHelper, remote, [:data]})
     refute_receive {:callback, :node_added, ^remote}, 200
   end
 
@@ -263,5 +265,20 @@ defmodule ClusterHelper.NodeConfigCallbackIntegrationTest do
     ClusterHelper.add_role(:dedup)
     assert_receive {:callback, :role_added, ^me, :dedup}, 500
     refute_receive {:callback, :role_added, ^me, :dedup}, 200
+  end
+  # ── Helpers ──────────────────────────────────────────────────────────────────
+
+  # Retry calling get_my_roles until the GenServer is ready to respond.
+  defp wait_for_gen_server(retries \\ 20)
+  defp wait_for_gen_server(0), do: :ok
+  defp wait_for_gen_server(retries) do
+    try do
+      ClusterHelper.get_my_roles()
+      :ok
+    catch
+      :exit, _ ->
+        Process.sleep(100)
+        wait_for_gen_server(retries - 1)
+    end
   end
 end

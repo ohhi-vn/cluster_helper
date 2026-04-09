@@ -3,11 +3,11 @@
 
 # ClusterHelper
 
-This library is built on OTP's `:pg` (Process Groups) and `:net_kernel` modules to manage dynamic Elixir clusters in environments like Kubernetes.
+This library helps to manage dynamic Elixir clusters in environments like Kubernetes.
 Each node has roles like `:data`, `:web`, `:cache` and other nodes joining the cluster can easily get nodes by role.
 A configurable scope allows separation into sub-clusters with full isolation between them.
 
-Library can use with [easy_rpc](https://hex.pm/packages/easy_rpc) for easy to develop an Elixir cluster. 
+Library can use with [easy_rpc](https://hex.pm/packages/easy_rpc) for easy to develop an dynamic Elixir cluster. 
 
 ## Installation
 
@@ -17,7 +17,7 @@ by adding `cluster_helper` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:cluster_helper, "~> 0.2"}
+    {:cluster_helper, "~> 0.5"}
   ]
 end
 ```
@@ -43,7 +43,7 @@ Add rols to config for node
 config :cluster_helper,
   # optional, all roles of current node. Can add role in runtime.
   roles: [:data, :web],
-  # optional, scope for :pg module. default scope is ClusterHelper
+  # optional, default scope is ClusterHelper
   scope: :my_cluster,
   # optional, default 5_000, timeout for sync between nodes.
   pull_timeout: 5_000, # ms
@@ -87,8 +87,18 @@ defmodule MyApp.ClusterEvents do
   end
 
   @impl true
+  def on_role_removed(node, role) do
+    Logger.info("#{node} lost role #{inspect(role)}")
+  end
+
+  @impl true
   def on_node_added(node) do
     Phoenix.PubSub.broadcast(MyApp.PubSub, "cluster", {:node_up, node})
+  end
+
+  @impl true
+  def on_node_removed(node) do
+    Phoenix.PubSub.broadcast(MyApp.PubSub, "cluster", {:node_down, node})
   end
 end
 ```

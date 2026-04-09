@@ -5,7 +5,11 @@ defmodule ClusterHelper.Application do
 
   @impl true
   def start(_type, _args) do
-    children = [ClusterHelper.NodeConfig]
+    children = [
+      {Task.Supervisor, name: ClusterHelper.TaskSupervisor},
+      ClusterHelper.NodeConfig
+    ]
+
     opts = [strategy: :one_for_one, name: ClusterHelper.Supervisor]
     Supervisor.start_link(children, opts)
   end

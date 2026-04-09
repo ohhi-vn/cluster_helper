@@ -12,6 +12,7 @@ defmodule ClusterHelper.AnyTypeRoleTest do
     on_exit(fn ->
       ClusterHelper.get_my_roles() |> Enum.each(&ClusterHelper.remove_role/1)
     end)
+
     :ok
   end
 
@@ -28,6 +29,12 @@ defmodule ClusterHelper.AnyTypeRoleTest do
       refute "api" in ClusterHelper.get_my_roles()
       assert ClusterHelper.get_nodes("api") == []
     end
+
+    test "removing a non-existent string role is a no-op" do
+      ClusterHelper.add_role("web")
+      ClusterHelper.remove_role("nonexistent_string")
+      assert "web" in ClusterHelper.get_my_roles()
+    end
   end
 
   describe "tuple roles" do
@@ -42,6 +49,12 @@ defmodule ClusterHelper.AnyTypeRoleTest do
       ClusterHelper.remove_role({:shard, 2})
       refute {:shard, 2} in ClusterHelper.get_my_roles()
       assert ClusterHelper.get_nodes({:shard, 2}) == []
+    end
+
+    test "removing a non-existent tuple role is a no-op" do
+      ClusterHelper.add_role({:shard, 1})
+      ClusterHelper.remove_role({:nonexistent, 99})
+      assert {:shard, 1} in ClusterHelper.get_my_roles()
     end
   end
 
@@ -85,6 +98,14 @@ defmodule ClusterHelper.AnyTypeRoleTest do
       ClusterHelper.add_role("web")
       count = ClusterHelper.get_my_roles() |> Enum.count(&(&1 == "web"))
       assert count == 1
+    end
+
+    test "removing a non-existent role does not affect existing roles" do
+      ClusterHelper.add_roles(["keep_me", {:keep, 1}])
+      ClusterHelper.remove_role("never_added")
+      ClusterHelper.remove_role({:never, 1})
+      assert "keep_me" in ClusterHelper.get_my_roles()
+      assert {:keep, 1} in ClusterHelper.get_my_roles()
     end
   end
 end

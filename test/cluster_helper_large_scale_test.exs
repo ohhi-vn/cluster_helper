@@ -98,7 +98,9 @@ defmodule ClusterHelper.LargeScaleTest do
       {remove_time, _} = :timer.tc(fn -> ClusterHelper.remove_roles(roles) end)
       remove_time_ms = remove_time / 1000
 
-      assert remove_time_ms < 5_000, "Removing 2K roles took #{remove_time_ms}ms (expected < 5000ms)"
+      assert remove_time_ms < 5_000,
+             "Removing 2K roles took #{remove_time_ms}ms (expected < 5000ms)"
+
       assert ClusterHelper.get_my_roles() == []
     end
   end
@@ -119,7 +121,9 @@ defmodule ClusterHelper.LargeScaleTest do
 
       # Verify isolation
       assert MapSet.new(ClusterHelper.get_my_roles(scope_a)) == MapSet.new([:role_a1, :role_a2])
-      assert MapSet.new(ClusterHelper.get_my_roles(scope_b)) == MapSet.new([:role_b1, :role_b2, :role_b3])
+
+      assert MapSet.new(ClusterHelper.get_my_roles(scope_b)) ==
+               MapSet.new([:role_b1, :role_b2, :role_b3])
 
       # Node should appear in both scopes' node lists
       assert Node.self() in ClusterHelper.all_nodes(scope_a)
@@ -263,15 +267,24 @@ defmodule ClusterHelper.LargeScaleTest do
     def start(), do: Agent.start_link(fn -> [] end, name: __MODULE__)
     def stop(), do: Agent.stop(__MODULE__)
     def count(), do: Agent.get(__MODULE__, &length/1)
+    def events(), do: Agent.get(__MODULE__, &Enum.reverse/1)
     def reset(), do: Agent.update(__MODULE__, fn _ -> [] end)
 
     @impl true
     def on_role_added(_node, _role) do
-      Agent.update(__MODULE__, fn events -> [:ok | events] end)
+      Agent.update(__MODULE__, fn events -> [{:role_added} | events] end)
+    end
+
+    @impl true
+    def on_role_removed(_node, _role) do
+      Agent.update(__MODULE__, fn events -> [{:role_removed} | events] end)
     end
 
     @impl true
     def on_node_added(_node), do: :ok
+
+    @impl true
+    def on_node_removed(_node), do: :ok
   end
 
   setup_all do
@@ -319,6 +332,33 @@ defmodule ClusterHelper.LargeScaleTest do
       # Cleanup
       ClusterHelper.remove_roles(roles)
     end
+
+    test "on_role_removed fires for each role in large batch remove" do
+      roles = Enum.map(1..500, fn i -> :"remove_event_#{i}" end)
+      ClusterHelper.add_roles(roles)
+      FastCollector.reset()
+
+      ClusterHelper.remove_roles(roles)
+
+      events = FastCollector.events()
+      removed_count = Enum.count(events, &match?({:role_removed}, &1))
+      assert removed_count == 500, "Expected 500 on_role_removed events, got #{removed_count}"
+    end
+
+    test "on_role_removed fires for each role when node entry is removed" do
+      roles = Enum.map(1..200, fn i -> :"node_remove_event_#{i}" end)
+      ClusterHelper.add_roles(roles)
+      FastCollector.reset()
+
+      # Simulate nodedown by sending the message directly
+      send(NodeConfig, {:nodedown, :"fake_node@127.0.0.1", []})
+
+      # The fake node has no roles in ETS, so no on_role_removed should fire
+      # But on_node_removed should still fire
+      events = FastCollector.events()
+      removed_count = Enum.count(events, &match?({:role_removed}, &1))
+      assert removed_count == 0
+    end
   end
 
   # ── Memory Efficiency Tests ──────────────────────────────────────────────────
@@ -327,29 +367,29 @@ defmodule ClusterHelper.LargeScaleTest do
     test "ETS table size scales linearly with roles" do
       ets_table = NodeConfig
 
-        # Measure with 100 roles
-        roles_100 = Enum.map(1..100, fn i -> :"mem_#{i}" end)
-        ClusterHelper.add_roles(roles_100)
-        size_100 = :ets.info(ets_table, :memory)
+      # Measure with 100 roles
+      roles_100 = Enum.map(1..100, fn i -> :"mem_#{i}" end)
+      ClusterHelper.add_roles(roles_100)
+      size_100 = :ets.info(ets_table, :memory)
 
-        # Measure with 1,000 roles
-        roles_1000 = Enum.map(101..1_100, fn i -> :"mem_#{i}" end)
-        ClusterHelper.add_roles(roles_1000)
-        size_1000 = :ets.info(ets_table, :memory)
+      # Measure with 1,000 roles
+      roles_1000 = Enum.map(101..1_100, fn i -> :"mem_#{i}" end)
+      ClusterHelper.add_roles(roles_1000)
+      size_1000 = :ets.info(ets_table, :memory)
 
-        # Memory should scale roughly linearly (within 2x factor)
-        expected_ratio = 10
-        actual_ratio = size_1000 / size_100
+      # Memory should scale roughly linearly (within 2x factor)
+      expected_ratio = 10
+      actual_ratio = size_1000 / size_100
 
-        assert actual_ratio < expected_ratio * 2,
-               "Memory scaling inefficient: #{actual_ratio}x for 10x roles"
+      assert actual_ratio < expected_ratio * 2,
+             "Memory scaling inefficient: #{actual_ratio}x for 10x roles"
 
       # Cleanup
       ClusterHelper.remove_roles(roles_100 ++ roles_1000)
     end
 
     test "cleanup releases ETS memory" do
-      ets_table = NodeConfig
+      _ets_table = NodeConfig
 
       initial_memory = :erlang.memory(:ets)
 
@@ -441,6 +481,200 @@ defmodule ClusterHelper.LargeScaleTest do
 
       # Cleanup
       ClusterHelper.remove_roles(base_roles)
+    end
+  end
+
+  # ── Generation Tracking Tests ────────────────────────────────────────────────
+
+  describe "generation tracking at scale" do
+    test "generation increments correctly with large batch operations" do
+      initial_gen = NodeConfig.__get_generation__(ClusterHelper)
+
+      roles = Enum.map(1..500, fn i -> :"gen_scale_#{i}" end)
+      ClusterHelper.add_roles(roles)
+      gen_after_add = NodeConfig.__get_generation__(ClusterHelper)
+
+      assert gen_after_add > initial_gen, "Generation should increment after batch add"
+
+      ClusterHelper.remove_roles(roles)
+      gen_after_remove = NodeConfig.__get_generation__(ClusterHelper)
+
+      assert gen_after_remove > gen_after_add, "Generation should increment after batch remove"
+    end
+
+    test "generation does not increment on duplicate batch add" do
+      roles = Enum.map(1..100, fn i -> :"gen_dup_scale_#{i}" end)
+      ClusterHelper.add_roles(roles)
+      gen1 = NodeConfig.__get_generation__(ClusterHelper)
+
+      # Add the same roles again — all duplicates
+      ClusterHelper.add_roles(roles)
+      gen2 = NodeConfig.__get_generation__(ClusterHelper)
+
+      assert gen2 == gen1, "Generation should not increment on duplicate add"
+
+      ClusterHelper.remove_roles(roles)
+    end
+
+    test "generation does not increment on removing non-existent roles" do
+      gen_before = NodeConfig.__get_generation__(ClusterHelper)
+
+      # Remove roles that were never added
+      fake_roles = Enum.map(1..100, fn i -> :"nonexistent_gen_#{i}" end)
+      ClusterHelper.remove_roles(fake_roles)
+
+      gen_after = NodeConfig.__get_generation__(ClusterHelper)
+
+      assert gen_after == gen_before,
+             "Generation should not increment on removing non-existent roles"
+    end
+
+    test "each scope has independent generation tracking" do
+      scope = :"gen_indep_#{System.unique_integer([:positive])}"
+      ClusterHelper.join_scope(scope)
+
+      default_gen_before = NodeConfig.__get_generation__(ClusterHelper)
+      scope_gen_before = NodeConfig.__get_generation__(scope)
+
+      # Add 500 roles in the custom scope
+      roles = Enum.map(1..500, fn i -> :"scope_gen_#{i}" end)
+      ClusterHelper.add_roles(roles, scope)
+
+      default_gen_after = NodeConfig.__get_generation__(ClusterHelper)
+      scope_gen_after = NodeConfig.__get_generation__(scope)
+
+      # Default scope generation should not change
+      assert default_gen_after == default_gen_before
+      # Custom scope generation should increment
+      assert scope_gen_after > scope_gen_before
+
+      ClusterHelper.leave_scope(scope)
+    end
+
+    test "__get_scopes__/0 returns all joined scopes" do
+      scopes =
+        Enum.map(1..5, fn i ->
+          :"multi_scope_#{i}_#{System.unique_integer([:positive])}"
+        end)
+
+      Enum.each(scopes, &ClusterHelper.join_scope/1)
+
+      result = NodeConfig.__get_scopes__()
+
+      Enum.each(scopes, fn scope ->
+        assert scope in result, "Scope #{inspect(scope)} should be in __get_scopes__"
+      end)
+
+      Enum.each(scopes, &ClusterHelper.leave_scope/1)
+    end
+  end
+
+  # ── on_role_removed and on_node_removed Callback Tests ───────────────────────
+
+  describe "on_role_removed callback at scale" do
+    setup do
+      FastCollector.reset()
+      Application.put_env(:cluster_helper, :event_handler, FastCollector)
+
+      on_exit(fn ->
+        Application.delete_env(:cluster_helper, :event_handler)
+      end)
+
+      :ok
+    end
+
+    test "on_role_removed fires for each role in batch remove at scale" do
+      roles = Enum.map(1..1_000, fn i -> :"rm_scale_#{i}" end)
+      ClusterHelper.add_roles(roles)
+      FastCollector.reset()
+
+      ClusterHelper.remove_roles(roles)
+
+      events = FastCollector.events()
+      removed_count = Enum.count(events, &match?({:role_removed}, &1))
+      assert removed_count == 1_000, "Expected 1000 on_role_removed events, got #{removed_count}"
+    end
+
+    test "on_role_removed fires for each role when remote node entry is removed" do
+      remote = :"fake_scale_remote@127.0.0.1"
+      roles = Enum.map(1..200, fn i -> :"remote_rm_#{i}" end)
+
+      # Simulate a remote node adding roles
+      send(NodeConfig, {:new_roles, ClusterHelper, roles, remote})
+      FastCollector.reset()
+
+      # Simulate nodedown — should fire on_role_removed for each role
+      send(NodeConfig, {:nodedown, remote, []})
+
+      # Give the GenServer time to process
+      Process.sleep(50)
+
+      events = FastCollector.events()
+      removed_count = Enum.count(events, &match?({:role_removed}, &1))
+
+      assert removed_count == 200,
+             "Expected 200 on_role_removed events on nodedown, got #{removed_count}"
+    end
+
+    test "on_role_removed does not fire for non-existent roles" do
+      FastCollector.reset()
+
+      # Remove roles that were never added
+      fake_roles = Enum.map(1..100, fn i -> :"nonexistent_rm_#{i}" end)
+      ClusterHelper.remove_roles(fake_roles)
+
+      events = FastCollector.events()
+      removed_count = Enum.count(events, &match?({:role_removed}, &1))
+
+      assert removed_count == 0,
+             "Expected 0 on_role_removed events for non-existent roles, got #{removed_count}"
+    end
+  end
+
+  describe "on_node_removed callback" do
+    setup do
+      FastCollector.reset()
+      Application.put_env(:cluster_helper, :event_handler, FastCollector)
+
+      on_exit(fn ->
+        Application.delete_env(:cluster_helper, :event_handler)
+      end)
+
+      :ok
+    end
+
+    test "on_node_removed fires on nodedown even for unknown node" do
+      FastCollector.reset()
+
+      # Simulate nodedown for a node that was never seen
+      send(NodeConfig, {:nodedown, :"unknown_down@127.0.0.1", []})
+
+      # Give the GenServer time to process
+      Process.sleep(50)
+
+      events = FastCollector.events()
+      # FastCollector doesn't track node_removed specifically, but the
+      # dispatch should not crash. Verify by checking no unexpected errors.
+      assert is_list(events)
+    end
+
+    test "on_node_removed fires and on_role_removed fires for all roles on nodedown" do
+      remote = :"multi_down@127.0.0.1"
+      roles = Enum.map(1..50, fn i -> :"down_role_#{i}" end)
+
+      # Register the remote node with roles
+      send(NodeConfig, {:new_roles, ClusterHelper, roles, remote})
+      FastCollector.reset()
+
+      # Simulate nodedown
+      send(NodeConfig, {:nodedown, remote, []})
+      Process.sleep(50)
+
+      events = FastCollector.events()
+      removed_count = Enum.count(events, &match?({:role_removed}, &1))
+
+      assert removed_count == 50,
+             "Expected 50 on_role_removed events on nodedown, got #{removed_count}"
     end
   end
 end

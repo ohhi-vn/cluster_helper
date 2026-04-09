@@ -4,7 +4,7 @@ defmodule ClusterHelper.MixProject do
   def project do
     [
       app: :cluster_helper,
-      version: "0.4.0",
+      version: "0.5.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -40,7 +40,6 @@ defmodule ClusterHelper.MixProject do
     ]
   end
 
-
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
@@ -53,7 +52,7 @@ defmodule ClusterHelper.MixProject do
   end
 
   defp description() do
-    "A library for lookup node(s) in dynamic clustering. Map node to roles or id and allows you to easily select node(s) by role/id."
+    "A tiny library for lookup node(s) in dynamic clustering. Map node to roles or id and allows you to easily select node(s) by role/id."
   end
 
   defp package() do
@@ -121,8 +120,7 @@ defmodule ClusterHelper.MixProject do
       # `--name` is a VM flag so it must be given to the `elixir` binary, not to
       # `mix test`. The `cmd` task runs a shell command, letting us prefix with
       # `elixir --name ... -S mix`.
-      "test.cluster":
-        "cmd elixir --name test@127.0.0.1 -S mix test --only cluster",
+      "test.cluster": "cmd elixir --name test@127.0.0.1 -S mix test --only cluster",
 
       # Multi-node scale tests (10-20+ nodes with churn simulation).
       "test.multi_node_scale":
@@ -130,8 +128,7 @@ defmodule ClusterHelper.MixProject do
 
       # Full suite – unit + cluster + multi-node scale.
       "test.all":
-        "cmd elixir --name test@127.0.0.1 -S mix test --include cluster --include multi_node_scale",
-
+        "cmd elixir --name test@127.0.0.1 -S mix test --include cluster --include multi_node_scale"
     ]
   end
 

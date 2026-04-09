@@ -3,8 +3,7 @@ defmodule ClusterHelper do
   A helper module for managing dynamic Elixir clusters with **overlapping scope** support.
 
   `ClusterHelper` provides a simple, role-based API for tracking nodes in a
-  distributed cluster. It is built on OTP's `:pg` (Process Groups) and
-  `:net_kernel` modules, designed for dynamic environments such as Kubernetes.
+  distributed cluster. It is designed for dynamic environments such as Kubernetes.
 
   Note: Collab between human & AI.
 
@@ -17,11 +16,18 @@ defmodule ClusterHelper do
     assigned to different scopes.
   - **Dynamic cluster support** – nodes are discovered and tracked automatically
     as they join or leave the cluster via `:net_kernel.monitor_nodes/2`
-  - **Fast lookups** – ETS-backed queries for both role→nodes and node→roles
+  - **Microsecond lookups** – read operations (`get_nodes/2`, `get_roles/2`,
+    `all_nodes/1`) bypass the GenServer and read directly from ETS tables
+    with `read_concurrency: true`
+  - **Generation-based sync** – each scope tracks a monotonically increasing
+    generation counter; periodic pulls only do a full RPC when the remote
+    node's generation has changed, dramatically reducing unnecessary traffic
+  - **Smart node discovery** – on `:nodeup`, the remote node's scope membership
+    is queried first so roles are only pulled for matching scopes
   - **Cluster-wide synchronisation** – changes propagate via `:pg` broadcast
-    and a configurable periodic pull
+    and a configurable periodic pull with generation-based change detection
   - **Event callbacks** – optional `ClusterHelper.EventHandler` behaviour
-    notifies your code when roles or nodes are added
+    notifies your code when roles or nodes are added **or removed**
 
   ## Quick start
 
@@ -86,6 +92,24 @@ defmodule ClusterHelper do
   [libcluster](https://hex.pm/packages/libcluster) or `Node.connect/1`).
   `ClusterHelper` only tracks *roles* – it does not handle node discovery.
 
+  ### Generation-based sync
+
+  Each scope maintains a local `generation` counter (starting at 0) that is
+  incremented every time roles are added or removed on this node. During the
+  periodic pull, the GenServer first checks the remote node's generation via a
+  lightweight `:erpc.call`. Only if the generation has changed (or the node is
+  newly discovered) does a full role pull occur. This avoids expensive full-sync
+  RPCs when nothing has changed, significantly reducing cluster traffic.
+
+  ### Smart node up/down handling
+
+  When a new node connects (`:nodeup`), `ClusterHelper` queries the remote
+  node's scope membership via `__get_scopes__/0` and only pulls roles for
+  scopes that both nodes share. This avoids unnecessary cross-scope RPCs.
+
+  When a node disconnects (`:nodedown`), all its roles are removed from every
+  scope and the `on_node_removed` callback is fired.
+
   ### Scope isolation
 
   Each scope maintains its own:
@@ -93,6 +117,7 @@ defmodule ClusterHelper do
   - Node-to-role mappings
   - `:pg` process group for messaging
   - Known-nodes tracking
+  - Generation counter for efficient sync
 
   A node can have `:web` role in scope `:frontend` and `:worker` role in scope
   `:backend` simultaneously. Queries are always scoped, so there is no cross-

@@ -80,8 +80,12 @@ defmodule ClusterHelper.MultiNodeScaleTest do
     end
   end
 
-  @spec wait_until((() -> boolean()), non_neg_integer(), String.t()) :: :ok
-  defp wait_until(condition, timeout \\ @convergence_timeout, msg \\ "condition never became true") do
+  @spec wait_until((-> boolean()), non_neg_integer(), String.t()) :: :ok
+  defp wait_until(
+        condition,
+        timeout \\ @convergence_timeout,
+        msg \\ "condition never became true"
+      ) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_poll(condition, deadline, msg)
   end
@@ -131,6 +135,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         # Verify each node has the correct number of roles (query directly)
         Enum.each(nodes, fn node ->
           roles = :erpc.call(node, ClusterHelper, :get_my_roles, [])
+
           assert length(roles) == roles_per_node,
                  "Node #{node} should have #{roles_per_node} roles, got #{length(roles)}"
         end)
@@ -143,17 +148,21 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         all_nodes = ClusterHelper.all_nodes()
         # Allow 50% threshold since pull-based sync is eventual
         min_expected = trunc(node_count * 0.5)
+
         assert length(all_nodes) >= min_expected,
                "Expected at least #{min_expected} nodes in all_nodes, got #{length(all_nodes)}"
 
         # Verify each node's roles are discoverable (eventual consistency)
         # Check a sample of nodes rather than all 20
         sample_nodes = Enum.take(nodes, 5)
+
         Enum.each(sample_nodes, fn node ->
           node_roles = :erpc.call(node, ClusterHelper, :get_my_roles, [])
+
           Enum.each(node_roles, fn role ->
             # Role should eventually be visible on test node
             nodes_with_role = ClusterHelper.get_nodes(role)
+
             assert node in nodes_with_role or length(nodes_with_role) > 0,
                    "Role #{role} from node #{node} should be visible"
           end)
@@ -214,6 +223,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
           # Nodes might still be in the list briefly due to pull cycle timing
           # but they should not be in the connected nodes list
           connected_wave_nodes = Enum.filter(wave_nodes, &(&1 in Node.list()))
+
           assert connected_wave_nodes == [],
                  "Wave #{wave} nodes should be cleaned up, got: #{inspect(connected_wave_nodes)}"
         rescue
@@ -254,6 +264,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         # Verify all roles are visible
         Enum.each(nodes, fn node ->
           roles = :erpc.call(node, ClusterHelper, :get_my_roles, [])
+
           assert length(roles) == roles_per_node
         end)
 
@@ -276,6 +287,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
           # Since the node is gone, we can't query it directly
           # Instead, check that no roles reference this node
           all_roles = ClusterHelper.all_nodes()
+
           refute node in all_roles,
                  "Node #{node} should be cleaned up from all_nodes, but still present"
         end)
@@ -291,6 +303,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         Enum.each(all_assigned_roles, fn role ->
           nodes_with_role = ClusterHelper.get_nodes(role)
           departed_still_present = Enum.filter(nodes_with_role, &(&1 in nodes))
+
           assert departed_still_present == [],
                  "Role #{role} still has departed nodes: #{inspect(departed_still_present)}"
         end)
@@ -327,6 +340,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         # Verify most nodes are visible (allow for convergence lag)
         all_nodes = ClusterHelper.all_nodes()
         min_expected = trunc((total_nodes + 1) * 0.8)
+
         assert length(all_nodes) >= min_expected,
                "Expected at least #{min_expected} nodes, got #{length(all_nodes)}"
 
@@ -351,6 +365,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         # Verify staying nodes' roles are still visible
         Enum.each(staying_nodes_list, fn node ->
           role = :"partial_node_#{Enum.find_index(nodes, &(&1 == node)) + 1}"
+
           assert node in ClusterHelper.get_nodes(role),
                  "Staying node's role #{role} should still be visible"
         end)
@@ -396,7 +411,9 @@ defmodule ClusterHelper.MultiNodeScaleTest do
 
         # Verify all nodes have the shared role
         nodes_with_role = ClusterHelper.get_nodes(shared_role)
+
         assert Node.self() in nodes_with_role
+
         Enum.each(nodes, fn node ->
           assert node in nodes_with_role,
                  "Node #{node} should have shared role #{shared_role}"
@@ -405,6 +422,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         # Verify each node sees other nodes with the shared role
         Enum.each(nodes, fn node ->
           node_sees = :erpc.call(node, ClusterHelper, :get_nodes, [shared_role])
+
           # Should see at least some peers (allow for convergence lag)
           assert length(node_sees) >= 1,
                  "Node #{node} should see at least 1 node with shared role, got #{length(node_sees)}"
@@ -450,12 +468,14 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         Enum.each(1..node_count, fn i ->
           role = :"unique_service_#{i}"
           nodes_with_role = ClusterHelper.get_nodes(role)
+
           assert length(nodes_with_role) == 1,
                  "Role #{role} should have exactly 1 node, got #{length(nodes_with_role)}"
         end)
 
         # Verify all_nodes includes all nodes
         all_nodes = ClusterHelper.all_nodes()
+
         assert length(all_nodes) >= node_count,
                "Expected at least #{node_count} nodes, got #{length(all_nodes)}"
       after
@@ -516,6 +536,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
 
       # Final verification - cluster should be stable
       Process.sleep(2000)
+
       assert Node.self() in ClusterHelper.all_nodes()
 
       # Cleanup
@@ -581,6 +602,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         # Verify roles are isolated - alpha roles only in scope A
         Enum.each(1..node_count, fn i ->
           alpha_role = :"alpha_node_#{i}"
+
           assert Node.self() not in ClusterHelper.get_nodes(alpha_role, scope_b),
                  "Alpha role #{alpha_role} should not be visible in scope B"
         end)
@@ -588,6 +610,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
         # Verify roles are isolated - beta roles only in scope B
         Enum.each(1..node_count, fn i ->
           beta_role = :"beta_node_#{i}"
+
           assert Node.self() not in ClusterHelper.get_nodes(beta_role, scope_a),
                  "Beta role #{beta_role} should not be visible in scope A"
         end)

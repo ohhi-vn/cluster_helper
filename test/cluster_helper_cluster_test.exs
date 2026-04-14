@@ -433,8 +433,12 @@ defmodule ClusterHelper.ClusterTest do
   # Poll `condition` every @poll_interval ms until it returns truthy.
   # Calls ExUnit.Assertions.flunk/1 with `msg` on timeout so the test
   # failure output is descriptive.
-  @spec wait_until((() -> boolean()), non_neg_integer(), String.t()) :: :ok
-  defp wait_until(condition, timeout \\ @propagation_timeout, msg \\ "condition never became true") do
+  @spec wait_until((-> boolean()), non_neg_integer(), String.t()) :: :ok
+  defp wait_until(
+        condition,
+        timeout \\ @propagation_timeout,
+        msg \\ "condition never became true"
+      ) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_poll(condition, deadline, msg)
   end

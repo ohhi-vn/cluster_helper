@@ -490,9 +490,16 @@ defmodule ClusterHelper.NodeConfig do
           try do
             :erpc.call(remote_node, ClusterHelper.NodeConfig, :__get_scopes__, [], 2000)
           catch
-            :exit, _ ->
-              # Fallback: assume the remote node is in all our scopes
-              MapSet.to_list(local_scopes)
+            :exit, reason ->
+              Logger.warning(
+                "Failed to get scopes from #{inspect(remote_node)}, reason: #{inspect(reason)}"
+              )
+
+              []
+
+            :error, :undef ->
+              Logger.debug("MFA not found on #{inspect(remote_node)}, skipped")
+              []
           end
 
         matching_scopes = Enum.filter(remote_scopes, &MapSet.member?(local_scopes, &1))

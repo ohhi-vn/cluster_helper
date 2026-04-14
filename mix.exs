@@ -4,7 +4,7 @@ defmodule ClusterHelper.MixProject do
   def project do
     [
       app: :cluster_helper,
-      version: "0.5.0",
+      version: "0.5.1",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -47,7 +47,11 @@ defmodule ClusterHelper.MixProject do
       {:benchee, "~> 1.5", only: :dev},
       {:tidewave, "~> 0.5", only: :dev},
       {:bandit, "~> 1.10", only: :dev},
-      {:usage_rules, "~> 1.2", only: [:dev]}
+      {:usage_rules, "~> 1.2", only: [:dev]},
+
+      # Code quality
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
 
@@ -128,7 +132,11 @@ defmodule ClusterHelper.MixProject do
 
       # Full suite – unit + cluster + multi-node scale.
       "test.all":
-        "cmd elixir --name test@127.0.0.1 -S mix test --include cluster --include multi_node_scale"
+        "cmd elixir --name test@127.0.0.1 -S mix test --include cluster --include multi_node_scale",
+      # Testing & Coverage
+      coveralls: ["test --cover"],
+      # Code Quality
+      quality: ["format --check-formatted", "credo --strict", "dialyzer"]
     ]
   end
 

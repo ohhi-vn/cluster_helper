@@ -49,6 +49,9 @@ defmodule ClusterHelper.MixProject do
       {:bandit, "~> 1.10", only: :dev},
       {:usage_rules, "~> 1.2", only: [:dev]},
 
+      # Test dependencies
+      {:excoveralls, "~> 0.18", only: :test},
+
       # Code quality
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
@@ -134,7 +137,7 @@ defmodule ClusterHelper.MixProject do
       "test.all":
         "cmd elixir --name test@127.0.0.1 -S mix test --include cluster --include multi_node_scale",
       # Testing & Coverage
-      coveralls: ["test --cover"],
+      coveralls: ["test --cover", "coveralls.html"],
       # Code Quality
       quality: ["format --check-formatted", "credo --strict", "dialyzer"]
     ]

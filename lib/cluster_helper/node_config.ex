@@ -96,10 +96,18 @@ defmodule ClusterHelper.NodeConfig do
   Returns all roles assigned to the local node.
 
   If `scope` is `nil`, returns roles from the default scope.
+
+  Reads directly from ETS for microsecond-level lookups.
+  Uses `:ets.select/2` with match spec for efficient data extraction.
   """
   @spec get_my_roles(scope :: atom() | nil) :: [ClusterHelper.role()]
-  def get_my_roles(scope \\ nil),
-    do: GenServer.call(__MODULE__, {:get_my_roles, resolve_scope(scope)})
+  def get_my_roles(scope \\ nil) do
+    scope = resolve_scope(scope)
+    pattern = {{:scope, scope, :node, Node.self()}, :"$1"}
+    guard = []
+    result = [:"$1"]
+    :ets.select(@ets_table, [{pattern, guard, result}])
+  end
 
   @doc """
   Returns every node in the given `scope` that has been assigned `role`.
@@ -107,15 +115,15 @@ defmodule ClusterHelper.NodeConfig do
   If `scope` is `nil`, uses the default scope.
 
   Reads directly from ETS for microsecond-level lookups without GenServer overhead.
+  Uses `:ets.select/2` with match spec for efficient data extraction.
   """
   @spec get_nodes(ClusterHelper.role(), scope :: atom() | nil) :: [node()]
   def get_nodes(role, scope \\ nil) do
     scope = resolve_scope(scope)
-
-    case Ets.lookup(@ets_table, {:scope, scope, :role, role}) do
-      [] -> []
-      tuples -> for {_, node} <- tuples, do: node
-    end
+    pattern = {{:scope, scope, :role, role}, :"$1"}
+    guard = []
+    result = [:"$1"]
+    :ets.select(@ets_table, [{pattern, guard, result}])
   end
 
   @doc """
@@ -124,15 +132,15 @@ defmodule ClusterHelper.NodeConfig do
   If `scope` is `nil`, uses the default scope.
 
   Reads directly from ETS for microsecond-level lookups without GenServer overhead.
+  Uses `:ets.select/2` with match spec for efficient data extraction.
   """
   @spec get_roles(node(), scope :: atom() | nil) :: [ClusterHelper.role()]
   def get_roles(node, scope \\ nil) do
     scope = resolve_scope(scope)
-
-    case Ets.lookup(@ets_table, {:scope, scope, :node, node}) do
-      [] -> []
-      tuples -> for {_, role} <- tuples, do: role
-    end
+    pattern = {{:scope, scope, :node, node}, :"$1"}
+    guard = []
+    result = [:"$1"]
+    :ets.select(@ets_table, [{pattern, guard, result}])
   end
 
   @doc """
@@ -146,7 +154,7 @@ defmodule ClusterHelper.NodeConfig do
   @spec all_nodes(scope :: atom() | nil) :: [node()]
   def all_nodes(scope \\ nil) do
     scope = resolve_scope(scope)
-    Ets.select(@ets_nodes_table, [{{{:scope, scope, :"$1"}}, [], [:"$1"]}])
+    :ets.select(@ets_nodes_table, [{{{:scope, scope, :"$1"}}, [], [:"$1"]}])
   end
 
   @doc """
@@ -239,7 +247,7 @@ defmodule ClusterHelper.NodeConfig do
     Ets.new(@ets_table, [
       :bag,
       :named_table,
-      :protected,
+      :public,
       :compressed,
       read_concurrency: true,
       write_concurrency: true
@@ -248,7 +256,7 @@ defmodule ClusterHelper.NodeConfig do
     Ets.new(@ets_nodes_table, [
       :set,
       :named_table,
-      :protected,
+      :public,
       :compressed,
       read_concurrency: true,
       write_concurrency: true
@@ -398,6 +406,7 @@ defmodule ClusterHelper.NodeConfig do
   end
 
   def handle_call({:get_my_roles, scope}, _from, state) do
+    # This is now a fallback; primary implementation reads from ETS directly
     roles = Map.get(state.roles, scope, MapSet.new()) |> MapSet.to_list()
     {:reply, roles, state}
   end
@@ -707,12 +716,10 @@ defmodule ClusterHelper.NodeConfig do
     end
   end
 
-  defp add_my_roles(roles, scope) do
+  defp insert_roles_for_node(node, scope, roles) do
     if roles == [] do
       :ok
     else
-      node = Node.self()
-
       # Batch insert for significantly better performance
       entries =
         Enum.flat_map(roles, fn role ->
@@ -722,48 +729,33 @@ defmodule ClusterHelper.NodeConfig do
           ]
         end)
 
-      Ets.insert(@ets_table, entries)
-      Ets.insert(@ets_nodes_table, {{:scope, scope, node}})
+      :ets.insert(@ets_table, entries)
+      :ets.insert(@ets_nodes_table, {{:scope, scope, node}})
 
       # Fire callbacks synchronously for correctness
       Enum.each(roles, fn role ->
         EventHandler.dispatch_role_added(node, role)
       end)
     end
+  end
+
+  defp add_my_roles(roles, scope) do
+    insert_roles_for_node(Node.self(), scope, roles)
   end
 
   defp add_roles_for_node(node, scope, roles) do
-    if roles == [] do
-      :ok
-    else
-      # Batch insert for significantly better performance
-      entries =
-        Enum.flat_map(roles, fn role ->
-          [
-            {{:scope, scope, :role, role}, node},
-            {{:scope, scope, :node, node}, role}
-          ]
-        end)
-
-      Ets.insert(@ets_table, entries)
-      Ets.insert(@ets_nodes_table, {{:scope, scope, node}})
-
-      # Fire callbacks synchronously for correctness
-      Enum.each(roles, fn role ->
-        EventHandler.dispatch_role_added(node, role)
-      end)
-    end
+    insert_roles_for_node(node, scope, roles)
   end
 
   defp remove_role_entry_fast(node, scope, role) do
-    Ets.delete_object(@ets_table, {{:scope, scope, :role, role}, node})
-    Ets.delete_object(@ets_table, {{:scope, scope, :node, node}, role})
+    :ets.delete_object(@ets_table, {{:scope, scope, :role, role}, node})
+    :ets.delete_object(@ets_table, {{:scope, scope, :node, node}, role})
 
     dispatch_role_removed(node, role)
 
     # Clean up node entry if no more roles remain for this node in this scope
-    case Ets.lookup(@ets_table, {:scope, scope, :node, node}) do
-      [] -> Ets.delete(@ets_nodes_table, {:scope, scope, node})
+    case :ets.lookup(@ets_table, {:scope, scope, :node, node}) do
+      [] -> :ets.delete(@ets_nodes_table, {:scope, scope, node})
       _ -> :ok
     end
   end
@@ -771,14 +763,14 @@ defmodule ClusterHelper.NodeConfig do
   defp remove_node_entry(node, scope) do
     # Read current roles before removing to fire on_role_removed callbacks
     current_roles =
-      case Ets.lookup(@ets_table, {:scope, scope, :node, node}) do
+      case :ets.lookup(@ets_table, {:scope, scope, :node, node}) do
         [] -> []
         tuples -> for {_, role} <- tuples, do: role
       end
 
-    Ets.match_delete(@ets_table, {{:scope, scope, :node, node}, :_})
-    Ets.match_delete(@ets_table, {{:scope, scope, :role, :_}, node})
-    Ets.delete(@ets_nodes_table, {:scope, scope, node})
+    :ets.match_delete(@ets_table, {{:scope, scope, :node, node}, :_})
+    :ets.match_delete(@ets_table, {{:scope, scope, :role, :_}, node})
+    :ets.delete(@ets_nodes_table, {:scope, scope, node})
 
     # Fire callbacks for each removed role
     Enum.each(current_roles, &dispatch_role_removed(node, &1))
@@ -804,14 +796,19 @@ defmodule ClusterHelper.NodeConfig do
     Task.Supervisor.start_child(@task_supervisor, fn ->
       Logger.debug("Pulling roles from #{inspect(remote_node)} for scope #{inspect(scope)}")
 
-      case pull_roles_from_node(scope, remote_node) do
-        {:ok, roles} ->
-          send(server, {msg_tag, scope, remote_node, roles})
+      try do
+        case pull_roles_from_node(scope, remote_node) do
+          {:ok, roles} ->
+            send(server, {msg_tag, scope, remote_node, roles})
 
-        {:error, reason} ->
-          Logger.warning(
-            "ClusterHelper: failed to pull from #{inspect(remote_node)}: #{inspect(reason)}"
-          )
+          {:error, reason} ->
+            Logger.warning(
+              "ClusterHelper: failed to pull from #{inspect(remote_node)}: #{inspect(reason)}"
+            )
+        end
+      rescue
+        e ->
+          Logger.error("Unexpected error pulling from #{inspect(remote_node)}: #{inspect(e)}")
       end
     end)
   end
@@ -836,48 +833,60 @@ defmodule ClusterHelper.NodeConfig do
     Task.Supervisor.start_child(@task_supervisor, fn ->
       # Check generations and only pull if changed
       Enum.each(live_nodes, fn node ->
-        known_gen = Map.get(remote_gens, node)
+        try do
+          known_gen = Map.get(remote_gens, node)
 
-        case get_remote_generation(node, scope) do
-          {:ok, remote_gen} when remote_gen != known_gen ->
-            # Generation changed or node is new, do full pull
-            case pull_roles_from_node(scope, node) do
-              {:ok, roles} ->
-                send(server, {:pull_update_node, scope, node, roles, remote_gen})
+          case get_remote_generation(node, scope) do
+            {:ok, remote_gen} when remote_gen != known_gen ->
+              # Generation changed or node is new, do full pull
+              case pull_roles_from_node(scope, node) do
+                {:ok, roles} ->
+                  send(server, {:pull_update_node, scope, node, roles, remote_gen})
 
-              {:error, reason} ->
-                Logger.warning(
-                  "ClusterHelper: failed to pull from #{inspect(node)}: #{inspect(reason)}"
-                )
-            end
+                {:error, reason} ->
+                  Logger.warning(
+                    "ClusterHelper: failed to pull from #{inspect(node)}: #{inspect(reason)}"
+                  )
+              end
 
-          {:ok, _same_gen} ->
-            # Generation unchanged, skip pull
-            :ok
+            {:ok, _same_gen} ->
+              # Generation unchanged, skip pull
+              :ok
 
-          {:error, reason} ->
-            Logger.warning(
-              "ClusterHelper: failed to get generation from #{inspect(node)}: #{inspect(reason)}"
+            {:error, reason} ->
+              Logger.warning(
+                "ClusterHelper: failed to get generation from #{inspect(node)}: #{inspect(reason)}"
+              )
+
+              # Fall back to full pull on generation check failure
+              case pull_roles_from_node(scope, node) do
+                {:ok, roles} ->
+                  send(server, {:pull_update_node, scope, node, roles})
+
+                {:error, _} ->
+                  :ok
+              end
+          end
+        rescue
+          e ->
+            Logger.error(
+              "Unexpected error during generation check for #{inspect(node)}: #{inspect(e)}"
             )
-
-            # Fall back to full pull on generation check failure
-            case pull_roles_from_node(scope, node) do
-              {:ok, roles} ->
-                send(server, {:pull_update_node, scope, node, roles})
-
-              {:error, _} ->
-                :ok
-            end
         end
       end)
 
       # Clean up stale nodes (in ETS but not in Node.list())
-      known_nodes = all_nodes(scope)
-      stale_nodes = Enum.reject(known_nodes, &(&1 == current_node or &1 in live_nodes))
+      try do
+        known_nodes = all_nodes(scope)
+        stale_nodes = Enum.reject(known_nodes, &(&1 == current_node or &1 in live_nodes))
 
-      Enum.each(stale_nodes, fn node ->
-        send(server, {:stale_node, scope, node})
-      end)
+        Enum.each(stale_nodes, fn node ->
+          send(server, {:stale_node, scope, node})
+        end)
+      rescue
+        e ->
+          Logger.error("Error cleaning up stale nodes: #{inspect(e)}")
+      end
     end)
   end
 

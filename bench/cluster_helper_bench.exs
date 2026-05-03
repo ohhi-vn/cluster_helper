@@ -7,9 +7,17 @@
 #
 # Or with custom options:
 #   mix run bench/cluster_helper_bench.exs --time 10 --warmup 5
+#
+# For before/after comparison:
+#   1. Run with original code: mix run bench/cluster_helper_bench.exs > before.txt
+#   2. Apply changes and run again: mix run bench/cluster_helper_bench.exs > after.txt
+#   3. Compare the results
 
 # Start the ClusterHelper application
 Application.ensure_all_started(:cluster_helper)
+
+# Get the default scope for ETS key construction
+default_scope = Application.get_env(:cluster_helper, :scope, ClusterHelper)
 
 # Clean up any existing roles
 ClusterHelper.get_my_roles()
@@ -51,9 +59,7 @@ Benchee.run(
   warmup: 2,
   memory_time: 2,
   formatters: [
-    {Benchee.Formatters.Console,
-     comparisons: true,
-     extended_statistics: true}
+    {Benchee.Formatters.Console, comparisons: true, extended_statistics: true}
   ]
 )
 
@@ -107,9 +113,7 @@ Benchee.run(
   warmup: 2,
   memory_time: 2,
   formatters: [
-    {Benchee.Formatters.Console,
-     comparisons: true,
-     extended_statistics: true}
+    {Benchee.Formatters.Console, comparisons: true, extended_statistics: true}
   ]
 )
 
@@ -136,9 +140,17 @@ Enum.each(large_role_sets, fn {label, count} ->
   {get_time, _} = :timer.tc(fn -> ClusterHelper.get_my_roles() end)
   {remove_time, _} = :timer.tc(fn -> ClusterHelper.remove_roles(roles) end)
 
-  IO.puts("    Add #{count} roles:     #{:erlang.float_to_binary(add_time / 1000, decimals: 2)} ms")
-  IO.puts("    Get #{count} roles:     #{:erlang.float_to_binary(get_time / 1000, decimals: 2)} ms")
-  IO.puts("    Remove #{count} roles:  #{:erlang.float_to_binary(remove_time / 1000, decimals: 2)} ms")
+  IO.puts(
+    "    Add #{count} roles:     #{:erlang.float_to_binary(add_time / 1000, decimals: 2)} ms"
+  )
+
+  IO.puts(
+    "    Get #{count} roles:     #{:erlang.float_to_binary(get_time / 1000, decimals: 2)} ms"
+  )
+
+  IO.puts(
+    "    Remove #{count} roles:  #{:erlang.float_to_binary(remove_time / 1000, decimals: 2)} ms"
+  )
 end)
 
 # ── Benchmark 4: ETS Direct vs API ────────────────────────────────────────────
@@ -152,37 +164,49 @@ ClusterHelper.get_my_roles()
 test_roles_ets = Enum.map(1..500, fn i -> :"ets_role_#{i}" end)
 ClusterHelper.add_roles(test_roles_ets)
 
+# ETS table names (must match node_config.ex)
 ets_table = ClusterHelper.NodeConfig
+ets_nodes_table = :"#{ets_table}_nodes"
+
+IO.puts("  ETS tables: #{inspect(ets_table)} and #{inspect(ets_nodes_table)}")
+IO.puts("  Default scope: #{inspect(default_scope)}\n")
 
 Benchee.run(
   %{
-    "API: get_nodes/1" => fn ->
-      Enum.each(test_roles_ets, &ClusterHelper.get_nodes/1)
-    end,
-    "ETS: direct lookup" => fn ->
+    "API: get_nodes/1 (scoped)" => fn ->
       Enum.each(test_roles_ets, fn role ->
-        :ets.lookup(ets_table, {:role, role})
+        ClusterHelper.get_nodes(role)
       end)
     end,
-    "API: get_roles/1" => fn ->
+    "ETS: direct lookup (scoped)" => fn ->
+      Enum.each(test_roles_ets, fn role ->
+        :ets.lookup(ets_table, {:scope, default_scope, :role, role})
+      end)
+    end,
+    "API: get_roles/1 (scoped)" => fn ->
       ClusterHelper.get_roles(Node.self())
     end,
-    "ETS: direct lookup (node)" => fn ->
-      :ets.lookup(ets_table, {:node, Node.self()})
+    "ETS: direct lookup (node, scoped)" => fn ->
+      :ets.lookup(ets_table, {:scope, default_scope, :node, Node.self()})
+    end,
+    "API: get_my_roles/0" => fn ->
+      ClusterHelper.get_my_roles()
+    end,
+    "ETS: direct lookup (my roles)" => fn ->
+      :ets.lookup(ets_table, {:scope, default_scope, :node, Node.self()})
     end,
     "API: all_nodes/0" => fn ->
       ClusterHelper.all_nodes()
     end,
-    "ETS: select (nodes)" => fn ->
-      :ets.select(:"#{ets_table}_nodes", [{{:"$1"}, [], [:"$1"]}])
+    "ETS: select (nodes, scoped)" => fn ->
+      :ets.select(ets_nodes_table, [{{:scope, default_scope, :"$1"}, [], [:"$1"]}])
     end
   },
   time: 5,
   warmup: 2,
+  memory_time: 2,
   formatters: [
-    {Benchee.Formatters.Console,
-     comparisons: true,
-     extended_statistics: true}
+    {Benchee.Formatters.Console, comparisons: true, extended_statistics: true}
   ]
 )
 
@@ -219,9 +243,48 @@ Benchee.run(
   warmup: 2,
   memory_time: 2,
   formatters: [
-    {Benchee.Formatters.Console,
-     comparisons: true,
-     extended_statistics: true}
+    {Benchee.Formatters.Console, comparisons: true, extended_statistics: true}
+  ]
+)
+
+# ── Benchmark 5: Concurrent Read Performance (Public vs Protected) ────────
+
+IO.puts("\n📊 Benchmark 5: Concurrent Read Performance\n")
+
+# Setup
+ClusterHelper.get_my_roles()
+|> Enum.each(&ClusterHelper.remove_role/1)
+
+concurrent_roles = Enum.map(1..1000, fn i -> :"concurrent_#{i}" end)
+ClusterHelper.add_roles(concurrent_roles)
+
+IO.puts("  Testing with #{length(concurrent_roles)} roles")
+IO.puts("  ETS table type: public (allows concurrent reads without GenServer)\n")
+
+Benchee.run(
+  %{
+    "Sequential reads (API)" => fn ->
+      Enum.each(1..100, fn _ ->
+        ClusterHelper.get_my_roles()
+      end)
+    end,
+    "Sequential reads (ETS direct)" => fn ->
+      Enum.each(1..100, fn _ ->
+        :ets.lookup(ets_table, {:scope, default_scope, :node, Node.self()})
+      end)
+    end,
+    "Batched role lookup (API)" => fn ->
+      ClusterHelper.get_nodes(:concurrent_500)
+    end,
+    "Batched role lookup (ETS direct)" => fn ->
+      :ets.lookup(ets_table, {:scope, default_scope, :role, :concurrent_500})
+    end
+  },
+  time: 5,
+  warmup: 2,
+  parallel: 4,
+  formatters: [
+    {Benchee.Formatters.Console, comparisons: true, extended_statistics: true}
   ]
 )
 
@@ -230,4 +293,9 @@ Benchee.run(
 ClusterHelper.get_my_roles()
 |> Enum.each(&ClusterHelper.remove_role/1)
 
-IO.puts("\n✅ Benchmarks complete!\n")
+IO.puts("\n✅ Benchmarks complete!")
+IO.puts("\n📈 Key improvements in this version:")
+IO.puts("   • ETS tables changed from :protected to :public")
+IO.puts("   • get_my_roles/1 now reads directly from ETS")
+IO.puts("   • Reduced code duplication in role insertion")
+IO.puts("   • Better error handling in async tasks\n")

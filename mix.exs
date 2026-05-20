@@ -4,8 +4,8 @@ defmodule ClusterHelper.MixProject do
   def project do
     [
       app: :cluster_helper,
-      version: "0.6.0",
-      elixir: "~> 1.15",
+      version: "0.7.0",
+      elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
 

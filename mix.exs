@@ -4,7 +4,7 @@ defmodule ClusterHelper.MixProject do
   def project do
     [
       app: :cluster_helper,
-      version: "0.7.0",
+      version: "0.7.1",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -45,8 +45,6 @@ defmodule ClusterHelper.MixProject do
     [
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
       {:benchee, "~> 1.5", only: :dev},
-      {:tidewave, "~> 0.5", only: :dev},
-      {:bandit, "~> 1.10", only: :dev},
       {:usage_rules, "~> 1.2", only: [:dev]},
 
       # Test dependencies
@@ -54,7 +52,8 @@ defmodule ClusterHelper.MixProject do
 
       # Code quality
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:ex_dna, "~> 1.5", only: [:dev, :test], runtime: false}
     ]
   end
 
@@ -109,9 +108,7 @@ defmodule ClusterHelper.MixProject do
 
   defp aliases do
     [
-      tidewave:
-        "run --no-halt -e 'Agent.start(fn -> Bandit.start_link(plug: Tidewave, port: 4112) end)'",
-      "usage_rules.update": [
+   "usage_rules.update": [
         """
         usage_rules.sync AGENTS.md --all \
           --inline usage_rules:all \

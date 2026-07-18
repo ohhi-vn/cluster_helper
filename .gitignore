@@ -25,3 +25,4 @@ cluster_helper-*.tar
 .expert/
 .elixir_ls/
 .dexter.db*
+.DS_Store

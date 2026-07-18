@@ -494,20 +494,32 @@ defmodule ClusterHelper.NodeConfig do
       local_scopes = state.scopes
 
       Task.Supervisor.start_child(@task_supervisor, fn ->
-        # Discover which scopes the remote node participates in
+        # Discover which scopes the remote node participates in.
+        # `safe_erpc_call/5` normalizes both raised and returned failures
+        # (including `:undef` when the remote node runs an older version
+        # without `__get_scopes__/0`), so a version mismatch can never crash
+        # this task.
         remote_scopes =
-          try do
-            :erpc.call(remote_node, ClusterHelper.NodeConfig, :__get_scopes__, [], 2000)
-          catch
-            :exit, reason ->
+          case safe_erpc_call(remote_node, ClusterHelper.NodeConfig, :__get_scopes__, [], 2000) do
+            {:ok, scopes} when is_list(scopes) ->
+              scopes
+
+            {:ok, other} ->
               Logger.warning(
-                "Failed to get scopes from #{inspect(remote_node)}, reason: #{inspect(reason)}"
+                "Unexpected scopes response from #{inspect(remote_node)}: #{inspect(other)}"
               )
 
               []
 
-            :error, :undef ->
-              Logger.debug("MFA not found on #{inspect(remote_node)}, skipped")
+            {:error, {:exception, :undef, _}} ->
+              Logger.debug("__get_scopes__ not found on #{inspect(remote_node)}, skipped")
+              []
+
+            {:error, reason} ->
+              Logger.warning(
+                "Failed to get scopes from #{inspect(remote_node)}: #{inspect(reason)}"
+              )
+
               []
           end
 
@@ -890,12 +902,37 @@ defmodule ClusterHelper.NodeConfig do
     end)
   end
 
-  defp get_remote_generation(node, scope) do
+  # Wraps `:erpc.call/5`, normalizing every failure mode into
+  # `{:ok, result}` or `{:error, reason}`.
+  #
+  # Depending on the OTP version, a failed remote call surfaces in one of two
+  # ways:
+  #   * raised  -> `:erlang.error({:exception, class, reason})`
+  #   * returned -> `{:exception, class, reason}` as a plain value
+  #
+  # Both are captured here so callers never have to special-case them, and a
+  # remote node running an incompatible version can't crash the caller.
+  defp safe_erpc_call(node, module, fun, args, timeout) do
     try do
-      gen = :erpc.call(node, ClusterHelper.NodeConfig, :__get_generation__, [scope], 1000)
-      {:ok, gen}
+      case :erpc.call(node, module, fun, args, timeout) do
+        {:exception, class, reason} ->
+          {:error, {:exception, class, reason}}
+
+        result ->
+          {:ok, result}
+      end
     catch
       :exit, reason -> {:error, reason}
+      kind, reason -> {:error, {kind, reason}}
+    end
+  end
+
+  defp get_remote_generation(node, scope) do
+    case safe_erpc_call(node, ClusterHelper.NodeConfig, :__get_generation__, [scope], 1000) do
+      {:ok, gen} when is_integer(gen) -> {:ok, gen}
+      {:ok, other} -> {:error, {:bad_generation, other}}
+      {:error, {:exception, :undef, _}} -> {:error, :undef}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -929,33 +966,27 @@ defmodule ClusterHelper.NodeConfig do
   defp do_pull_with_retry(scope, node, timeout, retries) do
     retry_timeout = if retries < 3, do: min(timeout, 1000), else: timeout
 
-    result =
-      try do
-        :erpc.call(node, ClusterHelper, :get_my_roles, [scope], retry_timeout)
-      catch
-        :exit, reason -> {:error, reason}
-      end
-
-    case result do
-      {:error, {:exception, {:noproc, _}}} when retries > 1 ->
-        Process.sleep(200)
-        do_pull_with_retry(scope, node, timeout, retries - 1)
-
-      {:error, {:noproc, _}} when retries > 1 ->
-        Process.sleep(200)
-        do_pull_with_retry(scope, node, timeout, retries - 1)
-
-      {:error, reason} ->
-        {:error, reason}
-
-      roles when is_list(roles) ->
+    case safe_erpc_call(node, ClusterHelper, :get_my_roles, [scope], retry_timeout) do
+      {:ok, roles} when is_list(roles) ->
         {:ok, roles}
 
-      other ->
-        Logger.debug("Unexpected pull result from #{inspect(node)}: #{inspect(other)}")
-        {:error, other}
+      {:error, {:exception, :undef, _}} ->
+        # Remote node runs an older version without get_my_roles/1; nothing to pull.
+        {:error, :undef}
+
+      {:error, reason} ->
+        if noproc?(reason) and retries > 1 do
+          Process.sleep(200)
+          do_pull_with_retry(scope, node, timeout, retries - 1)
+        else
+          {:error, reason}
+        end
     end
   end
+
+  defp noproc?({:noproc, _}), do: true
+  defp noproc?({:exception, _, {:noproc, _}}), do: true
+  defp noproc?(_), do: false
 
   defp schedule_pull(interval), do: Process.send_after(self(), :pull_roles, interval)
 

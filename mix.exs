@@ -4,8 +4,8 @@ defmodule ClusterHelper.MixProject do
   def project do
     [
       app: :cluster_helper,
-      version: "0.7.1",
-      elixir: "~> 1.18",
+      version: "1.0.0",
+      elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
 
@@ -43,9 +43,9 @@ defmodule ClusterHelper.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:telemetry, "~> 1.4"},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
       {:benchee, "~> 1.5", only: :dev},
-      {:usage_rules, "~> 1.2", only: [:dev]},
 
       # Test dependencies
       {:excoveralls, "~> 0.18", only: :test},
@@ -80,35 +80,39 @@ defmodule ClusterHelper.MixProject do
   end
 
   defp extras do
-    list =
+    guides =
       "guides/**/*.md"
       |> Path.wildcard()
+      |> Enum.map(&guide_entry/1)
 
-    list = list ++ ["README.md"]
-
-    list
-    |> Enum.map(fn path ->
-      title =
-        path
-        |> Path.basename(".md")
-        |> String.split(~r|[-_]|)
-        |> Enum.map_join(" ", &String.capitalize/1)
-        |> case do
-          "F A Q" -> "FAQ"
-          no_change -> no_change
-        end
-
-      {String.to_atom(path),
-       [
-         title: title,
-         default: title == "Guide"
-       ]}
-    end)
+    [{"README.md", [title: "Overview", default: true]} | guides]
   end
+
+  defp guide_entry(path) do
+    title =
+      path
+      |> Path.basename(".md")
+      |> String.replace(~r/[-_]/, " ")
+      |> String.split(" ")
+      |> Enum.map_join(" ", &String.capitalize/1)
+      |> case do
+        "F A Q" -> "FAQ"
+        title -> title
+      end
+
+    group = guide_group(path)
+
+    {String.to_atom(path), [title: title, group: group]}
+  end
+
+  defp guide_group("guides/SCOPES" <> _), do: "Advanced"
+  defp guide_group("guides/TELEMETRY" <> _), do: "Advanced"
+  defp guide_group("guides/ADAPTERS" <> _), do: "Advanced"
+  defp guide_group(_), do: "Getting Started"
 
   defp aliases do
     [
-   "usage_rules.update": [
+      "usage_rules.update": [
         """
         usage_rules.sync AGENTS.md --all \
           --inline usage_rules:all \

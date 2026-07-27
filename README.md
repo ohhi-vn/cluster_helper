@@ -17,7 +17,7 @@ by adding `cluster_helper` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:cluster_helper, "~> 0.5"}
+    {:cluster_helper, "~> 1.0"}
   ]
 end
 ```

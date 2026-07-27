@@ -1,90 +1,32 @@
 defmodule ClusterHelper.NodeConfig do
   @moduledoc """
-  GenServer that owns the ETS role/node table and coordinates cluster sync.
+  GenServer that orchestrates cluster role management.
 
-  Supports **overlapping scopes**, allowing a node to participate in multiple
-  scopes simultaneously with full isolation between them. A node can have
-  different roles in different scopes.
+  This is the **application / orchestration layer** in Clean Architecture terms.
+  It coordinates:
+    * `ClusterHelper.ETSStore` — persists role↔node mappings
+    * `ClusterHelper.Broadcast` — cluster-wide event propagation via `:pg`
+    * `ClusterHelper.PullEngine` — background sync with generation-based detection
+    * `ClusterHelper.RemoteSync` — RPC to remote nodes
+    * `ClusterHelper.EventHandler` — user-defined callbacks
+    * `ClusterHelper.ClusterState` — pure in-memory state
 
-  ## Responsibilities
+  ## What changed (v0.7 → v0.8)
 
-  - Maintains an ETS `:bag` table keyed on `{:scope, scope, :role, role}` and
-    `{:scope, scope, :node, node}` for O(1) lookups in either direction, scoped.
-  - Maintains a separate ETS `:set` table for O(1) node enumeration per scope.
-  - Registers this node in a `:pg` group **per scope** for isolated messaging.
-  - Monitors node connections via `:net_kernel.monitor_nodes/2` (shared across scopes).
-  - On startup, pulls the current role state from every already-connected node
-    for each active scope.
-  - Broadcasts incremental add/remove events scoped to their respective groups
-    using `:pg.get_members/2` + `send/2` for efficient delivery.
-  - Periodically re-syncs using **generation-based change detection**: each scope
-    tracks a monotonically increasing generation counter that increments on every
-    local role change. Remote nodes are only fully pulled when their generation
-    has changed, dramatically reducing unnecessary RPC traffic.
-  - Invokes the optional `ClusterHelper.EventHandler` callbacks when roles or
-    nodes are added or removed from the local ETS table.
-
-  ## Performance characteristics
-
-  - **Read operations** (`get_nodes/2`, `get_roles/2`, `all_nodes/1`) bypass the
-    GenServer and read directly from ETS tables, which are `:protected` with
-    `read_concurrency: true`. This provides microsecond-level lookups without
-    GenServer bottleneck.
-  - **Batch ETS inserts** are used for bulk role additions, significantly reducing
-    the overhead of adding multiple roles at once.
-  - **Task.Supervisor** (`ClusterHelper.TaskSupervisor`) is used for all async
-    pull tasks, providing better fault tolerance and back-pressure compared to
-    bare `Task.start/1`.
-  - **`:pg.get_members/2` + `send/2`** is used for cluster-wide event broadcasting,
-    leveraging the VM's native process group membership for efficient delivery.
-
-  ## Generation-based sync
-
-  Each scope maintains a local `generation` counter (starting at 0) that is
-  incremented every time roles are added or removed on this node. During the
-  periodic pull, the GenServer first checks the remote node's generation via a
-  lightweight `:erpc.call` to `__get_generation__/1`. Only if the generation has
-  changed (or the node is newly discovered) does a full role pull occur. This
-  avoids expensive full-sync RPCs when nothing has changed.
-
-  ## Smart node up/down handling
-
-  On `:nodeup`, the GenServer discovers which scopes the new node participates
-  in by calling `__get_scopes__/0` on the remote node. It then only pulls roles
-  for matching scopes, avoiding unnecessary cross-scope RPCs. The `on_node_added`
-  callback fires for each scope where the node is discovered.
-
-  On `:nodedown`, the node is removed from all scopes and the `on_node_removed`
-  callback is fired.
-
-  ## Internal message protocol
-
-  | Message | Direction | Meaning |
-  |---------|-----------|---------|
-  | `{:new_roles, scope, roles, node}` | broadcast → handle_info | Remote node added roles in scope |
-  | `{:remove_roles, scope, roles, node}` | broadcast → handle_info | Remote node removed roles in scope |
-  | `{:nodeup, node, info}` | net_kernel → handle_info | Remote node came online |
-  | `{:nodedown, node, info}` | net_kernel → handle_info | Remote node went offline |
-  | `{:pull_new_node, scope, node, roles}` | Task → handle_info | Pulled roles from a newly discovered node |
-  | `{:pull_new_node, scope, node, roles, gen}` | Task → handle_info | Same, with generation metadata |
-  | `{:pull_update_node, scope, node, roles}` | Task → handle_info | Full-sync result for a known node |
-  | `{:pull_update_node, scope, node, roles, gen}` | Task → handle_info | Same, with generation metadata |
-  | `{:stale_node, scope, node}` | Task → handle_info | Node left the cluster, clean up |
-  | `:pull_roles` | Process.send_after → handle_info | Periodic sync tick |
+  Previously, `NodeConfig` was a ~1000-line God module mixing ETS, `:pg`,
+  RPC, config, and business logic. It has been decomposed into focused
+  modules — each with a single responsibility — while keeping the same
+  GenServer client API for full backward compatibility.
   """
 
   use GenServer, restart: :transient
 
   require Logger
 
-  alias :ets, as: Ets
-  alias :pg, as: Pg
+  alias ClusterHelper.ClusterState
   alias ClusterHelper.EventHandler
+  alias ClusterHelper.Telemetry
 
-  @ets_table __MODULE__
-  @ets_nodes_table :"#{@ets_table}_nodes"
-  @default_interval 7_000
-  @default_timeout 5_000
   @task_supervisor ClusterHelper.TaskSupervisor
 
   # ── Client API ────────────────────────────────────────────────────────────────
@@ -92,139 +34,67 @@ defmodule ClusterHelper.NodeConfig do
   @spec start_link(any()) :: GenServer.on_start()
   def start_link(_), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
 
-  @doc """
-  Returns all roles assigned to the local node.
-
-  If `scope` is `nil`, returns roles from the default scope.
-
-  Reads directly from ETS for microsecond-level lookups.
-  Uses `:ets.select/2` with match spec for efficient data extraction.
-  """
-  @spec get_my_roles(scope :: atom() | nil) :: [ClusterHelper.role()]
+  @doc "Returns all roles for the local node. Reads directly from ETS."
+  @spec get_my_roles(atom() | nil) :: [term()]
   def get_my_roles(scope \\ nil) do
-    scope = resolve_scope(scope)
-    pattern = {{:scope, scope, :node, Node.self()}, :"$1"}
-    guard = []
-    result = [:"$1"]
-    :ets.select(@ets_table, [{pattern, guard, result}])
+    role_store().get_my_roles(resolve_scope(scope))
   end
 
-  @doc """
-  Returns every node in the given `scope` that has been assigned `role`.
-
-  If `scope` is `nil`, uses the default scope.
-
-  Reads directly from ETS for microsecond-level lookups without GenServer overhead.
-  Uses `:ets.select/2` with match spec for efficient data extraction.
-  """
-  @spec get_nodes(ClusterHelper.role(), scope :: atom() | nil) :: [node()]
+  @doc "Returns nodes with the given role. Reads directly from ETS."
+  @spec get_nodes(term(), atom() | nil) :: [node()]
   def get_nodes(role, scope \\ nil) do
-    scope = resolve_scope(scope)
-    pattern = {{:scope, scope, :role, role}, :"$1"}
-    guard = []
-    result = [:"$1"]
-    :ets.select(@ets_table, [{pattern, guard, result}])
+    role_store().get_nodes(role, resolve_scope(scope))
   end
 
-  @doc """
-  Returns all roles assigned to `node` in the given `scope`.
-
-  If `scope` is `nil`, uses the default scope.
-
-  Reads directly from ETS for microsecond-level lookups without GenServer overhead.
-  Uses `:ets.select/2` with match spec for efficient data extraction.
-  """
-  @spec get_roles(node(), scope :: atom() | nil) :: [ClusterHelper.role()]
+  @doc "Returns roles for a node. Reads directly from ETS."
+  @spec get_roles(node(), atom() | nil) :: [term()]
   def get_roles(node, scope \\ nil) do
-    scope = resolve_scope(scope)
-    pattern = {{:scope, scope, :node, node}, :"$1"}
-    guard = []
-    result = [:"$1"]
-    :ets.select(@ets_table, [{pattern, guard, result}])
+    role_store().get_roles(node, resolve_scope(scope))
   end
 
-  @doc """
-  Returns a deduplicated list of every node that has at least one role in the
-  given `scope`.
-
-  If `scope` is `nil`, uses the default scope.
-
-  Reads directly from ETS for microsecond-level lookups without GenServer overhead.
-  """
-  @spec all_nodes(scope :: atom() | nil) :: [node()]
+  @doc "Returns all nodes with at least one role. Reads directly from ETS."
+  @spec all_nodes(atom() | nil) :: [node()]
   def all_nodes(scope \\ nil) do
-    scope = resolve_scope(scope)
-    :ets.select(@ets_nodes_table, [{{{:scope, scope, :"$1"}}, [], [:"$1"]}])
+    role_store().all_nodes(resolve_scope(scope))
   end
 
-  @doc """
-  Adds `role` to the current node in the given `scope` and propagates the change
-  cluster-wide.
-
-  If `scope` is `nil`, uses the default scope. The scope is automatically
-  joined if it hasn't been already.
-  """
-  @spec add_role(ClusterHelper.role(), scope :: atom() | nil) :: :ok
+  @doc "Adds a single role to the local node and propagates cluster-wide."
+  @spec add_role(term(), atom() | nil) :: :ok
   def add_role(role, scope \\ nil),
     do: GenServer.call(__MODULE__, {:add_roles, resolve_scope(scope), [role]})
 
-  @doc """
-  Adds each role in `roles` to the current node in the given `scope` and
-  propagates cluster-wide.
-
-  If `scope` is `nil`, uses the default scope.
-  """
-  @spec add_roles([ClusterHelper.role()], scope :: atom() | nil) :: :ok
+  @doc "Adds multiple roles to the local node and propagates cluster-wide."
+  @spec add_roles([term()], atom() | nil) :: :ok
   def add_roles(roles, scope \\ nil) when is_list(roles),
     do: GenServer.call(__MODULE__, {:add_roles, resolve_scope(scope), roles})
 
-  @doc """
-  Removes `role` from the current node in the given `scope` and propagates the
-  change cluster-wide.
-
-  If `scope` is `nil`, uses the default scope.
-  """
-  @spec remove_role(ClusterHelper.role(), scope :: atom() | nil) :: :ok
+  @doc "Removes a single role from the local node and propagates cluster-wide."
+  @spec remove_role(term(), atom() | nil) :: :ok
   def remove_role(role, scope \\ nil),
     do: GenServer.call(__MODULE__, {:remove_roles, resolve_scope(scope), [role]})
 
-  @doc """
-  Removes each role in `roles` from the current node in the given `scope` and
-  propagates cluster-wide.
-
-  If `scope` is `nil`, uses the default scope.
-  """
-  @spec remove_roles([ClusterHelper.role()], scope :: atom() | nil) :: :ok
+  @doc "Removes multiple roles from the local node and propagates cluster-wide."
+  @spec remove_roles([term()], atom() | nil) :: :ok
   def remove_roles(roles, scope \\ nil) when is_list(roles),
     do: GenServer.call(__MODULE__, {:remove_roles, resolve_scope(scope), roles})
 
-  @doc """
-  Joins the current node to an additional `scope`.
-
-  The scope is started (if not already), the node joins the `:all_nodes` group,
-  and an initial pull is performed from all connected nodes for this scope.
-  """
+  @doc "Joins an additional scope."
   @spec join_scope(atom()) :: :ok | {:error, :already_joined}
   def join_scope(scope) when is_atom(scope),
     do: GenServer.call(__MODULE__, {:join_scope, scope})
 
-  @doc """
-  Leaves the given `scope`, removing all local roles and cleaning up ETS entries
-  for this scope.
-  """
+  @doc "Leaves a scope, removing all roles and cleaning up."
   @spec leave_scope(atom()) :: :ok | {:error, :not_joined}
   def leave_scope(scope) when is_atom(scope),
     do: GenServer.call(__MODULE__, {:leave_scope, scope})
 
-  @doc """
-  Returns a list of all scopes the local node is currently participating in.
-  """
+  @doc "Lists all scopes the local node is participating in."
   @spec list_scopes() :: [atom()]
-  def list_scopes, do: GenServer.call(__MODULE__, :list_scopes)
+  def list_scopes do
+    GenServer.call(__MODULE__, :list_scopes)
+  end
 
-  @doc """
-  Returns `true` when `node` is the local node, `false` otherwise.
-  """
+  @doc "Returns true when the node is the local node."
   @spec local_node?(node()) :: boolean()
   def local_node?(node), do: node == Node.self()
 
@@ -236,7 +106,7 @@ defmodule ClusterHelper.NodeConfig do
 
   @doc false
   @spec __get_scopes__() :: [atom()]
-  def __get_scopes__() do
+  def __get_scopes__ do
     GenServer.call(__MODULE__, :__get_scopes__)
   end
 
@@ -244,101 +114,61 @@ defmodule ClusterHelper.NodeConfig do
 
   @impl true
   def init(_) do
-    Ets.new(@ets_table, [
-      :bag,
-      :named_table,
-      :public,
-      :compressed,
-      read_concurrency: true,
-      write_concurrency: true
-    ])
-
-    Ets.new(@ets_nodes_table, [
-      :set,
-      :named_table,
-      :public,
-      :compressed,
-      read_concurrency: true,
-      write_concurrency: true
-    ])
-
+    role_store().init()
     ensure_task_supervisor()
-
-    {:ok,
-     %{
-       scopes: MapSet.new(),
-       roles: %{},
-       known_nodes: %{},
-       generations: %{},
-       remote_generations: %{}
-     }, {:continue, :setup_cluster}}
+    {:ok, ClusterState.new(), {:continue, :setup_cluster}}
   end
 
   @impl true
   def handle_continue(:setup_cluster, state) do
     :net_kernel.monitor_nodes(true, node_type: :visible)
+    start_time = System.monotonic_time()
 
-    configured_scopes =
-      case Application.get_env(:cluster_helper, :scopes, nil) do
-        nil ->
-          [pg_scope()]
-
-        scopes when is_list(scopes) ->
-          scopes
-
-        bad ->
-          Logger.error("ClusterHelper: :scopes must be a list, got: #{inspect(bad)}")
-          [pg_scope()]
-      end
+    config = ClusterHelper.Config.from_app_env()
 
     state =
-      Enum.reduce(configured_scopes, state, fn scope, acc ->
-        ensure_scope_started(scope)
-        Pg.join(scope, :all_nodes, self())
+      case configured_scopes(config) do
+        {:ok, scopes} ->
+          Enum.reduce(scopes, state, fn scope, acc ->
+            ClusterHelper.Broadcast.start_scope(scope)
+            ClusterHelper.Broadcast.join(scope)
+            ClusterState.add_scope(acc, scope)
+          end)
 
-        %{
-          acc
-          | scopes: MapSet.put(acc.scopes, scope),
-            roles: Map.put_new(acc.roles, scope, MapSet.new()),
-            known_nodes: Map.put_new(acc.known_nodes, scope, MapSet.new()),
-            generations: Map.put_new(acc.generations, scope, 0),
-            remote_generations: Map.put_new(acc.remote_generations, scope, %{})
-        }
-      end)
+        {:error, scopes} ->
+          Enum.reduce(scopes, state, fn scope, acc ->
+            ClusterHelper.Broadcast.start_scope(scope)
+            ClusterHelper.Broadcast.join(scope)
+            ClusterState.add_scope(acc, scope)
+          end)
+      end
 
-    default_scope = pg_scope()
+    default_scope = config.scope
+    roles = config.roles
 
-    {roles, initial_gen} =
-      case Application.get_env(:cluster_helper, :roles, []) do
-        roles when is_list(roles) and roles != [] ->
-          Logger.info(
-            "ClusterHelper starting with roles: #{inspect(roles)} in scope #{inspect(default_scope)}"
-          )
+    state =
+      if roles != [] do
+        Logger.info(
+          "ClusterHelper starting with roles: #{inspect(roles)} in scope #{inspect(default_scope)}"
+        )
 
-          add_my_roles(roles, default_scope)
-          {MapSet.new(roles), 1}
-
-        roles when is_list(roles) ->
-          {MapSet.new(), 0}
-
-        bad ->
-          Logger.error("ClusterHelper: :roles must be a list, got: #{inspect(bad)}")
-          {MapSet.new(), 0}
+        role_store().insert_roles(Node.self(), default_scope, roles)
+        {state, _added, gen} = ClusterState.add_roles(state, default_scope, roles)
+        %{state | generations: Map.put(state.generations, default_scope, gen)}
+      else
+        state
       end
 
     Enum.each(state.scopes, fn scope ->
-      async_pull_roles_from_cluster(scope)
+      ClusterHelper.PullEngine.pull_all(self(), scope)
     end)
 
-    interval = Application.get_env(:cluster_helper, :pull_interval, @default_interval)
-    schedule_pull(interval)
+    schedule_pull(config.pull_interval)
 
-    {:noreply,
-     %{
-       state
-       | roles: Map.put(state.roles, default_scope, roles),
-         generations: Map.put(state.generations, default_scope, initial_gen)
-     }}
+    duration = System.monotonic_time() - start_time
+    Telemetry.emit_startup(duration, MapSet.to_list(state.scopes), roles)
+
+    {:noreply, state}
   end
 
   # ── Calls ─────────────────────────────────────────────────────────────────────
@@ -346,130 +176,84 @@ defmodule ClusterHelper.NodeConfig do
   @impl true
   def handle_call({:add_roles, scope, new_roles}, _from, state) do
     state = ensure_scope_in_state(state, scope)
-    current_roles = Map.get(state.roles, scope, MapSet.new())
-    roles_to_add = Enum.reject(new_roles, &MapSet.member?(current_roles, &1))
+    {state, roles_to_add, _gen} = ClusterState.add_roles(state, scope, new_roles)
 
     if roles_to_add != [] do
       Logger.debug(
         "Adding roles #{inspect(roles_to_add)} to #{inspect(Node.self())} in scope #{inspect(scope)}"
       )
 
-      add_my_roles(roles_to_add, scope)
-      broadcast(scope, {:new_roles, scope, roles_to_add, Node.self()})
-
-      new_roles_set = MapSet.union(current_roles, MapSet.new(roles_to_add))
-      new_gen = Map.get(state.generations, scope, 0) + 1
-
-      {:reply, :ok,
-       %{
-         state
-         | roles: Map.put(state.roles, scope, new_roles_set),
-           generations: Map.put(state.generations, scope, new_gen)
-       }}
-    else
-      {:reply, :ok, state}
+      role_store().insert_roles(Node.self(), scope, roles_to_add)
+      ClusterHelper.Broadcast.broadcast(scope, {:new_roles, scope, roles_to_add, Node.self()})
+      Telemetry.emit_role_add(scope, roles_to_add, Node.self())
     end
+
+    {:reply, :ok, state}
   end
 
+  @impl true
   def handle_call({:remove_roles, scope, roles_to_remove}, _from, state) do
     state = ensure_scope_in_state(state, scope)
-    current_roles = Map.get(state.roles, scope, MapSet.new())
-    roles_to_remove_set = MapSet.new(roles_to_remove)
-    # Only process roles that actually exist — avoids spurious callbacks and
-    # generation bumps when removing non-existent roles.
-    roles_actually_removed = MapSet.intersection(current_roles, roles_to_remove_set)
+    {state, actually_removed, _gen} = ClusterState.remove_roles(state, scope, roles_to_remove)
 
-    if MapSet.size(roles_actually_removed) > 0 do
+    if actually_removed != [] do
       Logger.debug(
-        "Removing roles #{inspect(MapSet.to_list(roles_actually_removed))} from #{inspect(Node.self())} in scope #{inspect(scope)}"
+        "Removing roles #{inspect(actually_removed)} from #{inspect(Node.self())} in scope #{inspect(scope)}"
       )
 
-      Enum.each(roles_actually_removed, &remove_role_entry_fast(Node.self(), scope, &1))
+      Enum.each(actually_removed, &role_store().delete_role(Node.self(), scope, &1))
 
-      broadcast(
+      ClusterHelper.Broadcast.broadcast(
         scope,
-        {:remove_roles, scope, MapSet.to_list(roles_actually_removed), Node.self()}
+        {:remove_roles, scope, actually_removed, Node.self()}
       )
 
-      roles_remaining = MapSet.difference(current_roles, roles_actually_removed)
-      new_gen = Map.get(state.generations, scope, 0) + 1
-
-      {:reply, :ok,
-       %{
-         state
-         | roles: Map.put(state.roles, scope, roles_remaining),
-           generations: Map.put(state.generations, scope, new_gen)
-       }}
-    else
-      {:reply, :ok, state}
+      Telemetry.emit_role_remove(scope, actually_removed, Node.self())
     end
+
+    {:reply, :ok, state}
   end
 
-  def handle_call({:get_my_roles, scope}, _from, state) do
-    # This is now a fallback; primary implementation reads from ETS directly
-    roles = Map.get(state.roles, scope, MapSet.new()) |> MapSet.to_list()
-    {:reply, roles, state}
-  end
-
+  @impl true
   def handle_call({:join_scope, scope}, _from, state) do
-    if MapSet.member?(state.scopes, scope) do
+    if ClusterState.has_scope?(state, scope) do
       {:reply, {:error, :already_joined}, state}
     else
-      ensure_scope_started(scope)
-      Pg.join(scope, :all_nodes, self())
-
-      state = %{
-        state
-        | scopes: MapSet.put(state.scopes, scope),
-          roles: Map.put_new(state.roles, scope, MapSet.new()),
-          known_nodes: Map.put_new(state.known_nodes, scope, MapSet.new()),
-          generations: Map.put_new(state.generations, scope, 0),
-          remote_generations: Map.put_new(state.remote_generations, scope, %{})
-      }
-
-      pull_roles_from_cluster(scope)
+      ClusterHelper.Broadcast.start_scope(scope)
+      ClusterHelper.Broadcast.join(scope)
+      state = ClusterState.add_scope(state, scope)
+      ClusterHelper.PullEngine.pull_all(self(), scope)
       {:reply, :ok, state}
     end
   end
 
+  @impl true
   def handle_call({:leave_scope, scope}, _from, state) do
-    if MapSet.member?(state.scopes, scope) do
-      current_roles = Map.get(state.roles, scope, MapSet.new()) |> MapSet.to_list()
+    if ClusterState.has_scope?(state, scope) do
+      current_roles = role_store().get_my_roles(scope)
 
-      if current_roles != [] do
-        Enum.each(current_roles, &remove_role_entry_fast(Node.self(), scope, &1))
-      end
+      Enum.each(current_roles, &role_store().delete_role(Node.self(), scope, &1))
 
-      Ets.delete(@ets_nodes_table, {:scope, scope, Node.self()})
-      Pg.leave(scope, :all_nodes, self())
-
-      Ets.match_delete(@ets_table, {{:scope, scope, :_, :_}, :_})
-      Ets.match_delete(@ets_nodes_table, {{:scope, scope, :_}})
-
-      state = %{
-        state
-        | scopes: MapSet.delete(state.scopes, scope),
-          roles: Map.delete(state.roles, scope),
-          known_nodes: Map.delete(state.known_nodes, scope),
-          generations: Map.delete(state.generations, scope),
-          remote_generations: Map.delete(state.remote_generations, scope)
-      }
-
+      role_store().purge_scope(scope)
+      ClusterHelper.Broadcast.leave(scope)
+      state = ClusterState.remove_scope(state, scope)
       {:reply, :ok, state}
     else
       {:reply, {:error, :not_joined}, state}
     end
   end
 
+  @impl true
   def handle_call(:list_scopes, _from, state) do
     {:reply, MapSet.to_list(state.scopes), state}
   end
 
+  @impl true
   def handle_call({:__get_generation__, scope}, _from, state) do
-    gen = Map.get(state.generations, scope, 0)
-    {:reply, gen, state}
+    {:reply, Map.get(state.generations, scope, 0), state}
   end
 
+  @impl true
   def handle_call(:__get_scopes__, _from, state) do
     {:reply, MapSet.to_list(state.scopes), state}
   end
@@ -479,178 +263,120 @@ defmodule ClusterHelper.NodeConfig do
   @impl true
   def handle_info(:pull_roles, state) do
     Enum.each(state.scopes, fn scope ->
-      async_pull_roles_from_cluster_with_generation_check(scope, state)
+      ClusterHelper.PullEngine.pull_all_with_generation_check(
+        self(),
+        scope,
+        state.remote_generations
+      )
     end)
 
-    schedule_pull(Application.get_env(:cluster_helper, :pull_interval, @default_interval))
+    config = ClusterHelper.Config.from_app_env()
+    schedule_pull(config.pull_interval)
     {:noreply, state}
   end
 
+  @impl true
   def handle_info({:nodeup, remote_node, _info}, state) do
     if remote_node != Node.self() do
       Logger.debug("Node up: #{inspect(remote_node)}")
-
-      server = self()
-      local_scopes = state.scopes
-
-      Task.Supervisor.start_child(@task_supervisor, fn ->
-        # Discover which scopes the remote node participates in.
-        # `safe_erpc_call/5` normalizes both raised and returned failures
-        # (including `:undef` when the remote node runs an older version
-        # without `__get_scopes__/0`), so a version mismatch can never crash
-        # this task.
-        remote_scopes =
-          case safe_erpc_call(remote_node, ClusterHelper.NodeConfig, :__get_scopes__, [], 2000) do
-            {:ok, scopes} when is_list(scopes) ->
-              scopes
-
-            {:ok, other} ->
-              Logger.warning(
-                "Unexpected scopes response from #{inspect(remote_node)}: #{inspect(other)}"
-              )
-
-              []
-
-            {:error, {:exception, :undef, _}} ->
-              Logger.debug("__get_scopes__ not found on #{inspect(remote_node)}, skipped")
-              []
-
-            {:error, reason} ->
-              Logger.warning(
-                "Failed to get scopes from #{inspect(remote_node)}: #{inspect(reason)}"
-              )
-
-              []
-          end
-
-        matching_scopes = Enum.filter(remote_scopes, &MapSet.member?(local_scopes, &1))
-
-        # Pull roles for each matching scope
-        Enum.each(matching_scopes, fn scope ->
-          case pull_roles_from_node(scope, remote_node) do
-            {:ok, roles} ->
-              gen =
-                case get_remote_generation(remote_node, scope) do
-                  {:ok, g} -> g
-                  {:error, _} -> nil
-                end
-
-              if gen do
-                send(server, {:pull_new_node, scope, remote_node, roles, gen})
-              else
-                send(server, {:pull_new_node, scope, remote_node, roles})
-              end
-
-            {:error, reason} ->
-              Logger.warning(
-                "ClusterHelper: failed to pull from #{inspect(remote_node)}: #{inspect(reason)}"
-              )
-          end
-        end)
-      end)
-
-      {:noreply, state}
-    else
-      {:noreply, state}
+      Telemetry.emit_node_up(remote_node, MapSet.to_list(state.scopes))
+      ClusterHelper.PullEngine.pull_new_node(self(), remote_node, state.scopes)
     end
+
+    {:noreply, state}
   end
 
+  @impl true
   def handle_info({:nodedown, remote_node, _info}, state) do
     Logger.debug("Node down: #{inspect(remote_node)}")
+    Telemetry.emit_node_down(remote_node)
 
     Enum.each(state.scopes, fn scope ->
-      remove_node_entry(remote_node, scope)
+      role_store().delete_node(remote_node, scope)
     end)
 
-    dispatch_node_removed(remote_node)
+    EventHandler.dispatch_node_removed(remote_node)
 
-    new_known =
-      Enum.reduce(state.scopes, state.known_nodes, fn scope, acc ->
-        Map.update(acc, scope, MapSet.new(), &MapSet.delete(&1, remote_node))
-      end)
+    state =
+      state
+      |> ClusterState.remove_known_node_from_all(remote_node)
+      |> ClusterState.remove_remote_gen_from_all(remote_node)
 
-    new_remote_gens =
-      Enum.reduce(state.scopes, state.remote_generations, fn scope, acc ->
-        Map.update(acc, scope, %{}, &Map.delete(&1, remote_node))
-      end)
-
-    {:noreply, %{state | known_nodes: new_known, remote_generations: new_remote_gens}}
+    {:noreply, state}
   end
 
+  @impl true
   def handle_info({:new_roles, scope, roles, remote_node}, state) do
-    if remote_node != Node.self() and MapSet.member?(state.scopes, scope) do
+    if remote_node != Node.self() and ClusterState.has_scope?(state, scope) do
       Logger.debug(
         "Received new roles #{inspect(roles)} from #{inspect(remote_node)} in scope #{inspect(scope)}"
       )
 
-      add_roles_for_node(remote_node, scope, roles)
-
-      new_known =
-        Map.update(state.known_nodes, scope, MapSet.new(), fn nodes ->
-          MapSet.put(nodes, remote_node)
-        end)
-
-      {:noreply, %{state | known_nodes: new_known}}
+      role_store().insert_roles(remote_node, scope, roles)
+      state = ClusterState.add_known_node(state, scope, remote_node)
+      {:noreply, state}
     else
       {:noreply, state}
     end
   end
 
+  @impl true
   def handle_info({:remove_roles, scope, roles, remote_node}, state) do
-    if remote_node != Node.self() and MapSet.member?(state.scopes, scope) do
+    if remote_node != Node.self() and ClusterState.has_scope?(state, scope) do
       Logger.debug(
         "Removing roles #{inspect(roles)} from #{inspect(remote_node)} in scope #{inspect(scope)}"
       )
 
-      Enum.each(roles, &remove_role_entry_fast(remote_node, scope, &1))
-
-      case Ets.lookup(@ets_table, {:scope, scope, :node, remote_node}) do
-        [] -> Ets.delete(@ets_nodes_table, {:scope, scope, remote_node})
-        _ -> :ok
-      end
+      Enum.each(roles, &role_store().delete_role(remote_node, scope, &1))
     end
 
     {:noreply, state}
   end
 
-  # Handle both old format (without generation) and new format (with generation)
+  @impl true
   def handle_info({:pull_update_node, scope, remote_node, roles}, state) do
     do_handle_pull_update_node(scope, remote_node, roles, nil, state)
   end
 
+  @impl true
   def handle_info({:pull_update_node, scope, remote_node, roles, new_gen}, state) do
     do_handle_pull_update_node(scope, remote_node, roles, new_gen, state)
   end
 
+  @impl true
   def handle_info({:pull_new_node, scope, remote_node, roles}, state) do
     do_handle_pull_new_node(scope, remote_node, roles, nil, state)
   end
 
+  @impl true
   def handle_info({:pull_new_node, scope, remote_node, roles, new_gen}, state) do
     do_handle_pull_new_node(scope, remote_node, roles, new_gen, state)
   end
 
+  @impl true
   def handle_info({:stale_node, scope, node}, state) do
     Logger.info(
       "ClusterHelper: node #{inspect(node)} left scope #{inspect(scope)}, removing roles"
     )
 
-    remove_node_entry(node, scope)
+    role_store().delete_node(node, scope)
 
-    new_known =
-      Map.update(state.known_nodes, scope, MapSet.new(), &MapSet.delete(&1, node))
+    state =
+      state
+      |> ClusterState.remove_known_node(scope, node)
+      |> then(fn s ->
+        update_in(s, [:remote_generations, scope], &Map.delete(&1 || %{}, node))
+      end)
 
-    new_remote_gens =
-      Map.update(state.remote_generations, scope, %{}, &Map.delete(&1, node))
-
-    {:noreply, %{state | known_nodes: new_known, remote_generations: new_remote_gens}}
-  end
-
-  def handle_info({:pull_complete, scope}, state) do
-    Logger.debug("Initial pull complete for scope #{inspect(scope)}")
     {:noreply, state}
   end
 
+  @impl true
+  def handle_info({:pull_complete, _scope}, state) do
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info(msg, state) do
     Logger.debug("ClusterHelper.NodeConfig received unexpected message: #{inspect(msg)}")
     {:noreply, state}
@@ -659,63 +385,54 @@ defmodule ClusterHelper.NodeConfig do
   # ── Private helpers ───────────────────────────────────────────────────────────
 
   defp do_handle_pull_update_node(scope, remote_node, roles, new_gen, state) do
-    remove_node_entry(remote_node, scope)
-    add_roles_for_node(remote_node, scope, roles)
+    role_store().delete_node(remote_node, scope)
+    role_store().insert_roles(remote_node, scope, roles)
 
-    new_known =
-      Map.update(state.known_nodes, scope, MapSet.new(), &MapSet.put(&1, remote_node))
+    state =
+      state
+      |> ClusterState.add_known_node(scope, remote_node)
 
-    new_remote_gens =
+    state =
       if new_gen do
-        Map.update(state.remote_generations, scope, %{}, &Map.put(&1, remote_node, new_gen))
+        ClusterState.put_remote_generation(state, scope, remote_node, new_gen)
       else
-        state.remote_generations
+        state
       end
 
-    {:noreply, %{state | known_nodes: new_known, remote_generations: new_remote_gens}}
+    {:noreply, state}
   end
 
   defp do_handle_pull_new_node(scope, remote_node, roles, new_gen, state) do
     EventHandler.dispatch_node_added(remote_node)
-    add_roles_for_node(remote_node, scope, roles)
+    role_store().insert_roles(remote_node, scope, roles)
 
-    new_known =
-      Map.update(state.known_nodes, scope, MapSet.new(), &MapSet.put(&1, remote_node))
+    state =
+      state
+      |> ClusterState.add_known_node(scope, remote_node)
 
-    new_remote_gens =
+    state =
       if new_gen do
-        Map.update(state.remote_generations, scope, %{}, &Map.put(&1, remote_node, new_gen))
+        ClusterState.put_remote_generation(state, scope, remote_node, new_gen)
       else
-        state.remote_generations
+        state
       end
 
-    {:noreply, %{state | known_nodes: new_known, remote_generations: new_remote_gens}}
+    {:noreply, state}
   end
 
   defp ensure_scope_in_state(state, scope) do
-    if MapSet.member?(state.scopes, scope) do
+    if ClusterState.has_scope?(state, scope) do
       state
     else
       Logger.info("Auto-joining scope #{inspect(scope)}")
-      ensure_scope_started(scope)
-      Pg.join(scope, :all_nodes, self())
-
-      %{
-        state
-        | scopes: MapSet.put(state.scopes, scope),
-          roles: Map.put_new(state.roles, scope, MapSet.new()),
-          known_nodes: Map.put_new(state.known_nodes, scope, MapSet.new()),
-          generations: Map.put_new(state.generations, scope, 0),
-          remote_generations: Map.put_new(state.remote_generations, scope, %{})
-      }
+      ClusterHelper.Broadcast.start_scope(scope)
+      ClusterHelper.Broadcast.join(scope)
+      ClusterState.add_scope(state, scope)
     end
   end
 
-  defp ensure_scope_started(scope) do
-    :pg.start(scope)
-  end
-
-  defp ensure_task_supervisor do
+  @doc false
+  def ensure_task_supervisor do
     case Process.whereis(@task_supervisor) do
       nil ->
         case Task.Supervisor.start_link(name: @task_supervisor) do
@@ -728,301 +445,25 @@ defmodule ClusterHelper.NodeConfig do
     end
   end
 
-  defp insert_roles_for_node(node, scope, roles) do
-    if roles == [] do
-      :ok
-    else
-      # Batch insert for significantly better performance
-      entries =
-        Enum.flat_map(roles, fn role ->
-          [
-            {{:scope, scope, :role, role}, node},
-            {{:scope, scope, :node, node}, role}
-          ]
-        end)
-
-      :ets.insert(@ets_table, entries)
-      :ets.insert(@ets_nodes_table, {{:scope, scope, node}})
-
-      # Fire callbacks synchronously for correctness
-      Enum.each(roles, fn role ->
-        EventHandler.dispatch_role_added(node, role)
-      end)
-    end
-  end
-
-  defp add_my_roles(roles, scope) do
-    insert_roles_for_node(Node.self(), scope, roles)
-  end
-
-  defp add_roles_for_node(node, scope, roles) do
-    insert_roles_for_node(node, scope, roles)
-  end
-
-  defp remove_role_entry_fast(node, scope, role) do
-    :ets.delete_object(@ets_table, {{:scope, scope, :role, role}, node})
-    :ets.delete_object(@ets_table, {{:scope, scope, :node, node}, role})
-
-    dispatch_role_removed(node, role)
-
-    # Clean up node entry if no more roles remain for this node in this scope
-    case :ets.lookup(@ets_table, {:scope, scope, :node, node}) do
-      [] -> :ets.delete(@ets_nodes_table, {:scope, scope, node})
-      _ -> :ok
-    end
-  end
-
-  defp remove_node_entry(node, scope) do
-    # Read current roles before removing to fire on_role_removed callbacks
-    current_roles =
-      case :ets.lookup(@ets_table, {:scope, scope, :node, node}) do
-        [] -> []
-        tuples -> for {_, role} <- tuples, do: role
-      end
-
-    :ets.match_delete(@ets_table, {{:scope, scope, :node, node}, :_})
-    :ets.match_delete(@ets_table, {{:scope, scope, :role, :_}, node})
-    :ets.delete(@ets_nodes_table, {:scope, scope, node})
-
-    # Fire callbacks for each removed role
-    Enum.each(current_roles, &dispatch_role_removed(node, &1))
-  end
-
-  defp broadcast(scope, message) do
-    # :pg.broadcast/3 or /4 is not available in all OTP versions,
-    # so we use :pg.get_members + send for efficient O(n) delivery.
-    # Filtering out self() avoids processing our own broadcasts.
-    local_pid = self()
-
-    scope
-    |> Pg.get_members(:all_nodes)
-    |> Enum.each(fn
-      pid when pid != local_pid -> send(pid, message)
-      _ -> :ok
-    end)
-  end
-
-  defp async_pull_node(scope, remote_node, msg_tag) do
-    server = self()
-
-    Task.Supervisor.start_child(@task_supervisor, fn ->
-      Logger.debug("Pulling roles from #{inspect(remote_node)} for scope #{inspect(scope)}")
-
-      try do
-        case pull_roles_from_node(scope, remote_node) do
-          {:ok, roles} ->
-            send(server, {msg_tag, scope, remote_node, roles})
-
-          {:error, reason} ->
-            Logger.warning(
-              "ClusterHelper: failed to pull from #{inspect(remote_node)}: #{inspect(reason)}"
-            )
-        end
-      rescue
-        e ->
-          Logger.error("Unexpected error pulling from #{inspect(remote_node)}: #{inspect(e)}")
-      end
-    end)
-  end
-
-  # Async wrapper for pull_roles_from_cluster to avoid blocking handle_continue.
-  defp async_pull_roles_from_cluster(scope) do
-    server = self()
-
-    Task.Supervisor.start_child(@task_supervisor, fn ->
-      pull_roles_from_cluster(scope)
-      send(server, {:pull_complete, scope})
-    end)
-  end
-
-  # Generation-aware periodic pull: only do full RPC when generation has changed.
-  defp async_pull_roles_from_cluster_with_generation_check(scope, state) do
-    server = self()
-    current_node = Node.self()
-    live_nodes = Enum.reject(Node.list(), &(&1 == current_node))
-    remote_gens = Map.get(state.remote_generations, scope, %{})
-
-    Task.Supervisor.start_child(@task_supervisor, fn ->
-      # Check generations and only pull if changed
-      Enum.each(live_nodes, fn node ->
-        try do
-          known_gen = Map.get(remote_gens, node)
-
-          case get_remote_generation(node, scope) do
-            {:ok, remote_gen} when remote_gen != known_gen ->
-              # Generation changed or node is new, do full pull
-              case pull_roles_from_node(scope, node) do
-                {:ok, roles} ->
-                  send(server, {:pull_update_node, scope, node, roles, remote_gen})
-
-                {:error, reason} ->
-                  Logger.warning(
-                    "ClusterHelper: failed to pull from #{inspect(node)}: #{inspect(reason)}"
-                  )
-              end
-
-            {:ok, _same_gen} ->
-              # Generation unchanged, skip pull
-              :ok
-
-            {:error, reason} ->
-              Logger.warning(
-                "ClusterHelper: failed to get generation from #{inspect(node)}: #{inspect(reason)}"
-              )
-
-              # Fall back to full pull on generation check failure
-              case pull_roles_from_node(scope, node) do
-                {:ok, roles} ->
-                  send(server, {:pull_update_node, scope, node, roles})
-
-                {:error, _} ->
-                  :ok
-              end
-          end
-        rescue
-          e ->
-            Logger.error(
-              "Unexpected error during generation check for #{inspect(node)}: #{inspect(e)}"
-            )
-        end
-      end)
-
-      # Clean up stale nodes (in ETS but not in Node.list())
-      try do
-        known_nodes = all_nodes(scope)
-        stale_nodes = Enum.reject(known_nodes, &(&1 == current_node or &1 in live_nodes))
-
-        Enum.each(stale_nodes, fn node ->
-          send(server, {:stale_node, scope, node})
-        end)
-      rescue
-        e ->
-          Logger.error("Error cleaning up stale nodes: #{inspect(e)}")
-      end
-    end)
-  end
-
-  # Wraps `:erpc.call/5`, normalizing every failure mode into
-  # `{:ok, result}` or `{:error, reason}`.
-  #
-  # Depending on the OTP version, a failed remote call surfaces in one of two
-  # ways:
-  #   * raised  -> `:erlang.error({:exception, class, reason})`
-  #   * returned -> `{:exception, class, reason}` as a plain value
-  #
-  # Both are captured here so callers never have to special-case them, and a
-  # remote node running an incompatible version can't crash the caller.
-  defp safe_erpc_call(node, module, fun, args, timeout) do
-    try do
-      case :erpc.call(node, module, fun, args, timeout) do
-        {:exception, class, reason} ->
-          {:error, {:exception, class, reason}}
-
-        result ->
-          {:ok, result}
-      end
-    catch
-      :exit, reason -> {:error, reason}
-      kind, reason -> {:error, {kind, reason}}
-    end
-  end
-
-  defp get_remote_generation(node, scope) do
-    case safe_erpc_call(node, ClusterHelper.NodeConfig, :__get_generation__, [scope], 1000) do
-      {:ok, gen} when is_integer(gen) -> {:ok, gen}
-      {:ok, other} -> {:error, {:bad_generation, other}}
-      {:error, {:exception, :undef, _}} -> {:error, :undef}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp pull_roles_from_cluster(scope) do
-    current_node = Node.self()
-
-    live_nodes =
-      Node.list()
-      |> Enum.reject(&(&1 == current_node))
-
-    Enum.each(live_nodes, &async_pull_node(scope, &1, :pull_update_node))
-
-    stale_nodes = all_nodes(scope) -- [current_node | live_nodes]
-
-    Enum.each(stale_nodes, fn node ->
-      Logger.info(
-        "ClusterHelper: node #{inspect(node)} left scope #{inspect(scope)}, removing roles"
-      )
-
-      remove_node_entry(node, scope)
-    end)
-  end
-
-  defp pull_roles_from_node(scope, node) do
-    timeout = Application.get_env(:cluster_helper, :pull_timeout, @default_timeout)
-    do_pull_with_retry(scope, node, timeout, 3)
-  end
-
-  # Retry :erpc.call up to 3 times with 200ms sleep to handle :noproc during
-  # peer startup. The periodic pull will catch any remaining failures.
-  defp do_pull_with_retry(scope, node, timeout, retries) do
-    retry_timeout = if retries < 3, do: min(timeout, 1000), else: timeout
-
-    case safe_erpc_call(node, ClusterHelper, :get_my_roles, [scope], retry_timeout) do
-      {:ok, roles} when is_list(roles) ->
-        {:ok, roles}
-
-      {:error, {:exception, :undef, _}} ->
-        # Remote node runs an older version without get_my_roles/1; nothing to pull.
-        {:error, :undef}
-
-      {:error, reason} ->
-        if noproc?(reason) and retries > 1 do
-          Process.sleep(200)
-          do_pull_with_retry(scope, node, timeout, retries - 1)
-        else
-          {:error, reason}
-        end
-    end
-  end
-
-  defp noproc?({:noproc, _}), do: true
-  defp noproc?({:exception, _, {:noproc, _}}), do: true
-  defp noproc?(_), do: false
-
   defp schedule_pull(interval), do: Process.send_after(self(), :pull_roles, interval)
 
-  defp pg_scope, do: Application.get_env(:cluster_helper, :scope, ClusterHelper)
+  defp role_store, do: ClusterHelper.Adapter.for(:role_store)
 
-  defp resolve_scope(nil), do: pg_scope()
+  defp resolve_scope(nil), do: ClusterHelper.Config.from_app_env().scope
   defp resolve_scope(scope) when is_atom(scope), do: scope
 
-  # ── Event dispatch helpers ───────────────────────────────────────────────────
-  # These handle the new on_role_removed and on_node_removed callbacks.
-  # They mirror the dispatch pattern in ClusterHelper.EventHandler for
-  # consistency. The callbacks are defined as optional in the EventHandler
-  # behaviour, so we check with function_exported? before calling.
+  @doc false
+  def configured_scopes(config) do
+    case config.scopes do
+      nil ->
+        {:ok, [config.scope]}
 
-  defp dispatch_role_removed(node, role) do
-    with {:ok, mod} <- event_handler_config(),
-         true <- function_exported?(mod, :on_role_removed, 2) do
-      mod.on_role_removed(node, role)
-    end
+      scopes when is_list(scopes) ->
+        {:ok, scopes}
 
-    :ok
-  end
-
-  defp dispatch_node_removed(node) do
-    with {:ok, mod} <- event_handler_config(),
-         true <- function_exported?(mod, :on_node_removed, 1) do
-      mod.on_node_removed(node)
-    end
-
-    :ok
-  end
-
-  defp event_handler_config do
-    case Application.get_env(:cluster_helper, :event_handler) do
-      nil -> :no_handler
-      mod -> {:ok, mod}
+      bad ->
+        Logger.error("ClusterHelper: :scopes must be a list, got: #{inspect(bad)}")
+        {:error, [config.scope]}
     end
   end
 end

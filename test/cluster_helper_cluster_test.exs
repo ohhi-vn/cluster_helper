@@ -295,6 +295,7 @@ defmodule ClusterHelper.ClusterTest do
           # node eventually discovers every other node.
           self_node = Node.self()
           all_nodes = [node0_members, node1_members, node2_members]
+
           Enum.all?(all_nodes, fn members ->
             self_node in members and node1 in members and node2 in members
           end)
@@ -447,10 +448,10 @@ defmodule ClusterHelper.ClusterTest do
   # failure output is descriptive.
   @spec wait_until((-> boolean()), non_neg_integer(), String.t()) :: :ok
   defp wait_until(
-        condition,
-        timeout \\ @propagation_timeout,
-        msg \\ "condition never became true"
-      ) do
+         condition,
+         timeout \\ @propagation_timeout,
+         msg \\ "condition never became true"
+       ) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_poll(condition, deadline, msg)
   end

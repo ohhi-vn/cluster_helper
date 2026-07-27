@@ -345,7 +345,9 @@ defmodule ClusterHelper do
       #=> [:cluster_helper, :analytics]
   """
   @spec list_scopes() :: [scope()]
-  def list_scopes(), do: NodeConfig.list_scopes()
+  def list_scopes do
+    NodeConfig.list_scopes()
+  end
 
   # ── Utility ───────────────────────────────────────────────────────────────────
 

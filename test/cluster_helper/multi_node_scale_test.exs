@@ -23,6 +23,7 @@ defmodule ClusterHelper.MultiNodeScaleTest do
     if Node.alive?() do
       IO.puts("\n🚀 Starting multi-node scale tests (#{Node.self()})\n")
     end
+
     :ok
   end
 
@@ -82,10 +83,10 @@ defmodule ClusterHelper.MultiNodeScaleTest do
 
   @spec wait_until((-> boolean()), non_neg_integer(), String.t()) :: :ok
   defp wait_until(
-        condition,
-        timeout \\ @convergence_timeout,
-        msg \\ "condition never became true"
-      ) do
+         condition,
+         timeout \\ @convergence_timeout,
+         msg \\ "condition never became true"
+       ) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_poll(condition, deadline, msg)
   end

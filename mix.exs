@@ -44,7 +44,7 @@ defmodule ClusterHelper.MixProject do
   defp deps do
     [
       {:telemetry, "~> 1.4"},
-      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false, warn_if_outdated: true},
       {:benchee, "~> 1.5", only: :dev},
 
       # Test dependencies
@@ -74,7 +74,7 @@ defmodule ClusterHelper.MixProject do
 
   defp docs do
     [
-      main: "README",
+      main: "readme",
       extras: extras()
     ]
   end
@@ -112,15 +112,6 @@ defmodule ClusterHelper.MixProject do
 
   defp aliases do
     [
-      "usage_rules.update": [
-        """
-        usage_rules.sync AGENTS.md --all \
-          --inline usage_rules:all \
-          --link-to-folder deps
-        """
-        |> String.trim()
-      ],
-
       # Default `mix test` – skip the real-cluster tests for fast feedback.
       test: ["test --exclude cluster"],
 
